@@ -1,0 +1,853 @@
+---
+title: "File FINALE"
+output:
+  pdf_document: default
+  html_document: default
+date: "2026-01-02"
+---
+# Load packages
+
+```{r}
+library(tinytex)
+```
+
+
+
+```{r Packages}
+
+library(dplyr)
+library(forecast)
+library(tsoutliers)
+library(lmtest)
+library(tseries)
+library(FinTS)
+library(ggplot2)
+library(ggfortify)
+library(broom)
+library(rugarch)
+library(forecast)
+library(lubridate)
+library(DescTools)
+library(tsdistributions)
+library(grid)
+library(gridExtra)
+library(Metrics)
+library(scoringRules)
+
+```
+
+
+# Load the dataset
+
+```{r Load the file}
+
+rm(list=ls())
+
+dataset_original <- read.csv2("heating_oil.csv",
+                             sep = ";",
+                             dec = ",",
+                            )
+```
+
+# Prepare the dataset
+
+```{r Prepare the dataset and transform into time series}
+
+dataset_original$Date <- as.Date(dataset_original$Date, format = "%m/%d/%Y")
+
+ho_monthly <- dataset_original %>%
+  mutate(YearMonth = as.Date(format(Date, "%Y-%m-01"))) %>%
+  group_by(YearMonth) %>%
+  summarise(Value = mean(Value, na.rm = TRUE))
+#we decided to work with monthly data to make the observations more homogeneous
+
+ho_ts <- ts(ho_monthly$Value,
+            start = c(1986, 2),
+            frequency = 12)
+
+ho_ts_log <- log(ho_ts) 
+#the logaritmic transformation converts the series into percentage-based changes, so allowing an interpretation in growth-rates. It also has the benefit to stabilize the variance and reduce skewness.
+
+```
+
+
+
+# Analyze the series
+
+```{r Plot the log series}
+autoplot(ho_ts_log) +
+  ggtitle("Log Price Time Series") +
+  xlab("Time") +
+  ylab("Log(Price)") +
+  theme_minimal()
+```
+
+```{r ACF and PACF of log prices}
+par(mfrow=c(1,2))
+
+acf(ho_ts_log, main="ACF of log prices", lag.max = 48)
+pacf(ho_ts_log, main="PACF of log prices", lag.max = 48)
+```
+ACF decays slowly and does not approach zero, indicating strong and persistent temporal dependence in the series. This suggests that 
+yt is highly correlated with its past values, and the process is non-stationary.
+The PACF drops to zero immediately after lag 1, indicating that only the first lag has a significant partial correlation with the series. This suggests an AR() structure.
+
+This two graphs do not suggest stationarity at this point, suggesting that to make the series stationary a non-seasonal operator is enough.
+
+# Make the series stationary
+
+```{r Apply the regular differencing operator and plot the differenciated series}
+ho_ts_log_diff <- diff(ho_ts_log)
+
+autoplot(ho_ts_log_diff) +
+  ggtitle("Log Price with non-seasonal differencing Time Series") +
+  xlab("Time") +
+  ylab("Log(Price)") +
+  theme_minimal()
+```
+After differencing, the series shows reduced trend and more stable fluctuations around a constant mean, suggesting an improvement in stationarity. 
+
+```{r ACF and PACF of Differenced Series}
+par(mfrow=c(1,2))
+
+acf(ho_ts_log_diff, main = "")
+pacf(ho_ts_log_diff, main = "")
+
+mtext("ACF and PACF of Differenced Series", side = 3, line = -2, outer = TRUE, cex = 1.5)
+
+```
+Differencing has indeed removed non-stationarity, as shown by the ACF which quickly drops within the confidence bounds, indicating weak autocorrelation. 
+The PACF shows a significant spike at lag 1 followed by smaller values, suggesting a short term autoregressive structure.
+
+## Consideration about seasonality
+Already at this point the ACF and PACF do not suggest seasonality. However, given the nature of the timeseries' subject, heating oil, one would think that seasons could affect prices. The reasoning behind is that in colder months there could be higher demand for it, to heat buildings. 
+However, this could be also ruled out by the argument that increase in consumption does not necessarly translate into increase in prices, as it could be that prices are stabilized legally.  
+Also the dataset refers to U.S. heating‑oil prices, which aggregate data across a very large and climatically diverse territory. Because only some regions (mainly the Northeast) rely heavily on heating oil, national‑level seasonality may appear muted or even absent, as colder‑region demand is partially offset by warmer states with minimal consumption.
+Nevertheless, just to be 100% sure about excluding the possibility of seasonality, the following statistical tests have been executed.
+
+### Harmonic regression
+
+Harmonic regression tests whether cyclical (sin/cos) components explain meaningful variation in the series.
+A small p‑value means the seasonal cycle is statistically present, while a large p‑value means it is not.
+
+Harmonic regression models seasonality by fitting smooth sinusoidal waves (sine and cosine terms) to the data. The significance test on these harmonic terms evaluates whether a deterministic seasonal pattern is present. 
+Under the null hypothesis H_0, the seasonal cycle has no systematic effect.  
+A small p‑value leads to rejecting H_0, indicating that a stable, repeating seasonal component is statistically detectable. Importantly, this approach does not test for stochastic or evolving seasonality — only for fixed, deterministic periodicity.
+
+```{r Harmonic regression}
+K = 2
+X <- fourier(ho_ts_log, K=K)  #NB: the test is applied to the series before differentiation
+harmonic_reg <- lm(as.numeric(ho_ts_log) ~ X )
+summary(harmonic_reg)
+
+```
+All sine/cosine coefficients have very large p-values. So there is no evidence of deterministic seasonality at the annual frequency (12 months) or its second harmonic.
+The joint F-test confirms this, with the p-value of 0.9875, as it tests the hypothesis 
+H0: all harmonic coefficients = 0 -> no deterministic seasonality 
+vs
+H1: at least one harmonic coefficient is not 0 -> seasonality present
+R^2 is almost 0, and the adjusted R^2 <0. This means that the Fourier terms explain 0% of the variance in the log-price series.
+
+### Stochastic seasonality
+
+To completetly exclude the presence of even stochastic seasonality, the function nsdiffs() has been applied. It tests whether the series contains stochastic (non‑deterministic) seasonality that would require seasonal differencing. Its logic is based on unit‑root tests at seasonal frequencies. 
+The null hypothesis H_0 is that a seasonal unit root is present — meaning the series has stochastic seasonality and needs seasonal differencing. The alternative H_1 is that no seasonal unit root exists, so seasonal differencing is unnecessary. A returned value of 0 indicates that the test finds no evidence of stochastic seasonality.
+
+```{r Testing non-deterministic seasonality}
+
+nsdiffs(ho_ts)
+```
+At this point it is clear that no seasonal component is present.
+
+```{r Model identification}
+par(mfrow=c(1,2))
+
+acf(ho_ts_log_diff, main = "")
+pacf(ho_ts_log_diff, main = "")
+
+mtext("ACF and PACF of Differenced Series", side = 3, line = -2, outer = TRUE, cex = 1.5)
+
+```
+The possible models that could be fit are:
+- ARIMA (1,1,1)
+- ARIMA (1,1,0) - going for a more parsimoniuos model
+
+```{r Compare models through the significance of parameters}
+mod1_1_0 <- arima(ho_ts_log, order=c(1,1,0), method="ML")
+mod1_1_1 <- arima(ho_ts_log, order=c(1,1,1), method="ML")
+
+
+tab <- rbind(
+  cbind(model = "ARIMA(1,1,0)", tidy(coeftest(mod1_1_0))),
+  cbind(model = "ARIMA(1,1,1)", tidy(coeftest(mod1_1_1)))
+)
+
+tab
+
+
+```
+As we can see from this table, the lowest p-value is obtained by the AR1 of ARIMA(1,1,0) model (with a value of 4e-7), which coherently is the coefficient most significantly different from 0 compared to the other two estimated coefficients. Indeed, for the ARIMA(1,1,1), the AR1 and MA1 coefficients have higher p-values (6.5e-1 and 2.9e-1, respectively) and their estimation is relatively closer to 0. 
+These are reasons why we opted for the ARIMA(1,1,0) to keep going with our analysis. 
+Before choosing though, we look at information criteria.
+
+```{r Compare models with AIC}
+AIC(mod1_1_0, mod1_1_1)
+```
+The AIC values for the two ARIMA models fitted to the log series are very similar, but ARIMA(1,1,0) still has the lowest (best) AIC, confirming the previous intuition.
+
+```{r Compare models with BIC}
+BIC(mod1_1_0, mod1_1_1)
+```
+Among the two ARIMA models fitted to the log series, ARIMA(1,1,0) clearly has the lowest (best) BIC value.
+The higher BIC value of ARIMA(1,1,1) could reflect the penalty for its additional parameter, which do not provide meaningful improvements in model fit - possibly without adding more explanatory power.
+BIC confirms that ARIMA(1,1,0) is the preferred model, offering the best balance between goodness‑of‑fit and parsimony. 
+
+# Residual analysis
+
+After selecting ARIMA(1,1,0) as the preferred model, the next step is to validate it by examining the residuals.
+A well‑specified ARIMA model should produce residuals that behave like white noise.
+In practice, this means checking three key conditions:
+- No autocorrelation: residuals should show no significant correlation at any lag (Ljung–Box test and ACF).
+- Zero mean: residuals should fluctuate around zero with no systematic bias.
+- No heteroskedasticity: the variance of the residuals should be constant over time (ARCH LM test).
+If these conditions are satisfied, the model can be considered adequate for inference and forecasting.
+
+
+```{r tsdiag on residuals}
+tsdiag(mod1_1_0)
+```
+The diagnostic plots for the ARIMA(1,1,0) model provide useful visual evidence about the behavior of the residuals. The standardized residuals fluctuate around zero with no clear autocorrelation structure, which is consistent with the Ljung–Box test result indicating that serial dependence has been successfully removed. However, the residuals display periods of varying volatility, suggesting potential heteroskedasticity.
+
+At this point we perform the statistical analysis to formalize the intuition.
+
+```{r Residual statistical analysis}
+res <- residuals(mod1_1_0)
+
+lb <- Box.test(res, lag=12, type="Ljung-Box")$p.value
+jb <- jarque.bera.test(res)$p.value
+arch <- ArchTest(res, lags=12)$p.value
+
+data.frame(LjungBox = lb, JarqueBera = jb, ARCH = arch)
+```
+To further assess the adequacy of the ARIMA(1,1,0) model, we evaluated the residuals using the Ljung–Box test, the Jarque–Bera test, and the ARCH LM test.
+
+- Ljung–Box test:
+The Ljung–Box statistic is low (≈ 0.55), indicating a high p‑value. This suggests that there is no evidence of residual autocorrelation, confirming that the ARIMA model has successfully captured the linear dependence structure of the series.
+
+- Jarque–Bera test:
+The Jarque–Bera statistic is extremely small (≈ 4.5×10⁻⁷), implying a very low p‑value. This indicates that the residuals deviate from normality, which is common in financial and commodity price data. While normality is not required for ARIMA consistency, it may affect the distribution of forecast errors.
+
+- ARCH LM test:
+The ARCH statistic is also very small (≈ 3×10⁻⁴), corresponding to a highly significant p‑value. This provides strong evidence of heteroskedasticity in the residuals, meaning that the variance is not constant over time and volatility clustering is present.
+
+Overall, the diagnostic tests show that the ARIMA(1,1,0) model adequately captures the mean dynamics of the log‑transformed series, as no autocorrelation remains in the residuals. However, the significant ARCH effects indicate that the model does not fully capture the conditional variance, suggesting that a GARCH‑type extension would be appropriate to model the time‑varying volatility observed in the data.
+
+# GARCH MODEL
+
+GARCH models are particularly useful for reducing ARCH problems because they model volatility as a dynamic process rather than a constant one. Instead of assuming that shocks have the same impact over time, a GARCH specification allows today’s variance to depend on past squared errors and past variances. This mechanism absorbs the autocorrelation in the squared residuals and captures the volatility clustering. 
+Under the broader GARCH family, several extensions refine this idea: 
+- EGARCH models log‑volatility and naturally incorporate asymmetry, allowing negative shocks to have a stronger impact than positive ones; 
+- APARCH models introduce a flexible power parameter and leverage term, enabling the variance to react differently to the magnitude and sign of shocks. These variants provide richer dynamics and often eliminate remaining ARCH effects more effectively than simpler specifications.
+
+In this study we focused on EGARCH and APARCH because they are the two GARCH‑type models best suitable for commodity series like heating oil, where volatility is persistent but extreme outliers are relatively rare. Standard GARCH models assume symmetric responses to shocks, which is often unrealistic in energy markets: negative price movements can trigger stronger volatility reactions than positive ones, and volatility tends to cluster even in the absence of large jumps. EGARCH and APARCH directly address these features.
+
+EGARCH models log‑volatility, ensuring positivity without constraints and allowing asymmetric reactions to shocks, which is useful when downside movements in heating‑oil prices generate disproportionate volatility. 
+APARCH extends this flexibility further by introducing a power parameter and a leverage term, enabling the model to adapt to different shock magnitudes and capture subtle asymmetries even when the dataset contains only a few outliers.
+
+Because the heating‑oil series showed limited extreme events but clear volatility clustering, these two models provided the right balance: they are flexible enough to capture asymmetry and nonlinear volatility dynamics, yet not overly complex for a dataset with only mild irregularities. This made EGARCH and APARCH the most appropriate candidates for addressing the residual ARCH effects observed in simpler specifications.
+
+```{r Prepare the dataset for GARCH-type models}
+# Load and prepare daily data
+ho <- read.csv2("heating_oil.csv", sep=";", dec=",")
+ho$Date <- as.Date(ho$Date, format="%m/%d/%Y")
+ho <- ho[order(ho$Date), ]
+
+# Daily % log returns
+daily_r <- diff(log(ho$Value)) * 100
+dates_r <- ho$Date[-1]
+
+returns_df <- data.frame(Date = dates_r, Return = daily_r)
+
+# ---- MONTHLY AGGREGATION ----
+r_ho <- returns_df %>%
+  mutate(YearMonth = as.Date(format(Date, "%Y-%m-01"))) %>%
+  group_by(YearMonth) %>%
+  summarise(Return = mean(Return, na.rm = TRUE))
+
+# ---- converted into a time series ----
+r_ho <- ts(r_ho$Return,
+           start = c(year(min(returns_df$Date)), month(min(returns_df$Date))),
+           frequency = 12)
+
+#---Winsorization of log-returns ---
+r_ho_wins <- Winsorize(
+  r_ho,
+  val = quantile(r_ho, probs = c(0.05, 0.95), na.rm = TRUE)
+)
+```
+
+
+As a benchmark, a standard symmetric GARCH(1,1) model was first estimated in combination with the selected ARMA mean specification. 
+```{r Trying to fit a GARCH(1,1)+ARMA(1,0)}
+# --- 1. Prepare the series ---
+# We already computed the winsorized log-returns: r_ho_wins
+
+# --- 2. Specify standard GARCH(1,1) with skewed Student-t ---
+spec_garch <- ugarchspec(
+  variance.model = list(
+    model = "sGARCH",        # standard symmetric GARCH
+    garchOrder = c(1,1)
+  ),
+  mean.model = list(
+    armaOrder = c(1,0),      # ARMA(1,0) mean equation
+    include.mean = TRUE
+  ),
+  distribution.model = "sstd"  # skewed Student-t for heavy tails
+)
+
+# --- 3. Fit the model ---
+fit_garch <- ugarchfit(
+  spec = spec_garch,
+  data = r_ho_wins,
+  solver = "hybrid",
+  solver.control = list(trace = 0)
+)
+
+# --- 4. Check fit summary ---
+fit_garch
+```
+```{r Check residuals and ARCH LM test of sGARCH}
+res_std0 <- residuals(fit_garch, standardize = TRUE)
+
+ArchTest(res_std0, lags = 12)  
+# should be non-significant if model captures volatility
+```
+While the sGARCH(1,1)–ARMA(1,0) model removes residual ARCH effects, the significant sign‑bias and joint tests indicate remaining asymmetry in the volatility response to shocks. In practice, this means that negative and positive returns do not affect volatility in the same way, with downturns typically generating stronger volatility reactions than upturns. Such leverage effects cannot be captured by a symmetric GARCH model, which motivates the use of asymmetric extensions such as EGARCH and APARCH, specifically designed to allow volatility to react differently to the sign and magnitude of shocks
+
+
+```{r Trying to fit an eGARCH(1,1) + ARMA(1,0)}
+
+# --- 1. Specify Robust EGARCH with skewed Student-t ---
+spec_egarch_xreg <- ugarchspec(
+  variance.model = list(
+    model = "eGARCH",          # EGARCH captures asymmetry
+    garchOrder = c(1,1)
+  ),
+  mean.model = list(
+    armaOrder = c(1,0),
+    include.mean = TRUE
+  ),
+  distribution.model = "sstd"  # skewed Student-t
+)
+
+# --- 2. Fit the model ---
+fit_egarch_xreg <- ugarchfit(
+  spec = spec_egarch_xreg,
+  data = r_ho_wins,
+  solver = "hybrid",
+  solver.control = list(trace = 0)
+)
+
+# --- 3. Check fit summary ---
+fit_egarch_xreg
+
+```
+
+```{r Check residuals and ARCH LM test of EGARCH}
+
+res_std <- residuals(fit_egarch_xreg, standardize = TRUE)
+
+ArchTest(res_std, lags = 12)  
+# should be non-significant if model captures volatility
+```
+The sign‑bias diagnostics show that the EGARCH(1,1)–ARMA(1,0) model captures most of the asymmetric dynamics in the heating‑oil return series. Neither the negative nor the positive sign‑bias components are statistically significant, and the joint sign‑bias test also fails to reject the null of no remaining asymmetry. Only the general sign‑bias term is weakly significant at the 10% level, suggesting that a small amount of asymmetry may remain, although the effect is not strong.
+This conclusion is further supported by the ARCH LM test applied to the standardized residuals. The test produces a p‑value of 0.2187, meaning we fail to reject the null hypothesis of no remaining ARCH effects. In other words, after fitting the EGARCH model, the residuals do not exhibit significant leftover conditional heteroskedasticity. This indicates that the model successfully captures the clustering and persistence in volatility.
+Taken together, these results imply that the EGARCH specification provides a generally adequate representation of the volatility process, effectively absorbing both heteroskedasticity and most asymmetric effects. The marginal significance of the general sign‑bias statistic suggests only a mild residual asymmetry, but not enough to undermine the overall suitability of the model.
+
+
+```{r Trying to fit an apARCH(1,1) + ARMA(1,0)}
+# --- 1. Specify a robust APARCH ---
+spec_aparch <- ugarchspec(
+  variance.model = list(
+    model = "apARCH",        # APARCH capturs asimmetry + leverage
+    garchOrder = c(1,1),
+    delta = 2           # default power = 2 (volatility squared)
+  ),
+  mean.model = list(
+    armaOrder = c(1,0),      
+    include.mean = TRUE
+  ),
+  distribution.model = "sstd"  # skewed Student-t
+)
+
+# --- 2. Model fit ---
+fit_aparch <- ugarchfit(
+  spec = spec_aparch,
+  data = r_ho_wins,
+  solver = "hybrid",
+  solver.control = list(trace = 0)
+)
+
+# --- 3. Check fit summary ---
+fit_aparch
+
+```
+All sign‑bias components are statistically insignificant, and therefore so it is also the joint test. This indicates that the APARCH(1,1) model successfully captures the asymmetric response of volatility to positive and negative shocks. In other words, the conditional variance equation is well specified, and there is no remaining evidence of unmodelled asymmetry in how shocks affect volatility
+
+```{r Check residuals and ARCH LM test of APARCH}
+
+res_std <- residuals(fit_aparch, standardize = TRUE)
+
+ArchTest(res_std, lags = 12)
+```
+The ARCH LM test is not significant (p = 0.2426), so we don't reject the null hypothesis of no ARCH effects. This indicates that the residuals no longer display volatility clustering, meaning the model successfully captures the conditional heteroskedasticity and the variance equation is adequately specified
+
+Taken together, the diagnostic results indicate that the APARCH(1,1)–ARMA(1,0) specification provides a well‑behaved and statistically adequate model for the heating‑oil return series. The absence of significant sign‑bias effects confirms that the model captures the asymmetric impact of shocks on volatility, while the non‑significant ARCH LM test shows that no residual heteroskedasticity remains. 
+This means that both the mean and variance equations are correctly specified, and the model successfully reproduces the key volatility dynamics of the series. Overall, the APARCH model emerges as a suitable and reliable framework for modelling the conditional volatility of heating‑oil prices.
+
+However we want to compare this model with an apARCH(1,1) with ARMA(1,1).
+
+```{r Trying to fit apARCH(1,1) + ARMA(1,1)}
+# --- 1. Specify a robust APARCH ---
+spec_aparch2 <- ugarchspec(
+  variance.model = list(
+    model = "apARCH",       
+    garchOrder = c(1,1),
+    delta = 2.5       
+  ),
+  mean.model = list(
+    armaOrder = c(1,1),      
+    include.mean = TRUE
+  ),
+  distribution.model = "sstd"  # skewed Student-t
+)
+
+# --- 2. Model fit ---
+fit_aparch2 <- ugarchfit(
+  spec = spec_aparch2,
+  data = r_ho_wins,
+  solver = "hybrid",
+  solver.control = list(trace = 0)
+)
+
+# --- 3. Check fit summary ---
+fit_aparch2
+
+```
+The model captures correctly the asymmetric volatility responses too. 
+
+```{r Check residuals and ARCH LM test of APARCH(1,0) + ARMA(1,1)}
+
+res_std2 <- residuals(fit_aparch2, standardize = TRUE)
+ArchTest(res_std2, lags = 12)
+```
+
+The model also shows no ARCH effect. 
+
+```{r Residuals analysis: validating the chosen GARCH models}
+
+# --- 1. Extract standardized residuals for each model ---
+res_egarch   <- residuals(fit_egarch_xreg, standardize = TRUE)
+res_aparch   <- residuals(fit_aparch, standardize = TRUE)
+res_aparch2  <- residuals(fit_aparch2, standardize = TRUE)
+
+# --- 2. Function to compute diagnostics for any model ---
+compute_tests <- function(residuals) {
+  lb  <- Box.test(residuals, lag = 12, type = "Ljung-Box")$p.value
+  jb  <- jarque.bera.test(residuals)$p.value
+  arch <- ArchTest(residuals, lags = 12)$p.value
+  
+  return(c(LjungBox = lb, JarqueBera = jb, ARCH = arch))
+}
+
+# --- 3. Apply tests to all models ---
+tests_egarch   <- compute_tests(res_egarch)
+tests_aparch   <- compute_tests(res_aparch)
+tests_aparch2  <- compute_tests(res_aparch2)
+
+# --- 4. Combine results into a single dataframe ---
+results <- data.frame(
+  Model = c("EGARCH(1,1)-ARMA(1,0)",
+            "APARCH(1,1)-ARMA(1,0), delta=2",
+            "APARCH(1,1)-ARMA(1,1), delta=2.5"),
+  rbind(tests_egarch, tests_aparch, tests_aparch2)
+)
+
+results
+```
+Across the three volatility models — EGARCH(1,1), APARCH(1,1) with δ=2, and APARCH(1,1) with δ=2.5 and ARMA(1,1) — the diagnostic checks show that all specifications perform reasonably well, with no major signs of remaining autocorrelation or ARCH effects.
+Normality (Jarque–Bera) is typically violated — as expected for financial returns — so deviations from normality are not surprising and do not invalidate these GARCH‑type models, which already assume a skewed Student‑t distribution.
+
+# Forecasting
+
+## Fan chart
+
+To evaluate the future dynamics of heating‑oil returns, the selected APARCH(1,1)–ARMA(1,0) model was used to generate both analytical forecasts and simulation‑based predictive distributions. 
+The ugarchforecast() function provides point forecasts for the conditional mean and volatility, while ugarchpath() allows the simulation of multiple future return trajectories under the estimated APARCH dynamics. 
+By simulating 5,000 paths over a 24‑day horizon, we obtain a full predictive distribution for each future period. The resulting fan chart visualizes the forecast uncertainty through percentile bands, illustrating how volatility evolves and how the range of plausible outcomes widens over time. This approach is well suited to GARCH‑type models, where the conditional variance is time‑varying and the forecast distribution is inherently asymmetric.
+each shaded band corresponds to a specific quantile range (from 5% to 95%).
+
+
+
+```{r Fan chart}
+
+# --- Ultimo prezzo osservato ---
+P0 <- tail(ho$Value, 1)
+spec_sim <- spec_aparch
+setfixed(spec_sim) <- as.list(coef(fit_aparch))
+h <- 24
+n_sim <- 5000
+
+sim_aparch <- ugarchpath(
+  # la specifica APARCH con parametri fissati.
+  spec_sim,
+  # numero di periodi futuri da simulare
+  n.sim = h,
+  # numero di simulazioni indipendenti da generare (qui 5000).
+  m.sim = n_sim,
+  presigma = tail(sigma(fit_aparch), 1),
+  prereturns = tail(r_ho_wins, 1),
+  preresiduals = tail(residuals(fit_aparch, standardize = TRUE), 1)
+)
+
+sim_returns <- fitted(sim_aparch)   # h x n_sim
+
+# --- Da rendimenti a livelli ---
+sim_prices <- apply(sim_returns, 2, function(x) {
+  P0 * exp(cumsum(x / 100))
+})
+# dimensione: h x n_sim
+
+# --- Quantili fan chart ---
+probs <- c(0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
+
+fan_prices <- apply(sim_prices, 1, quantile, probs = probs)
+fan_prices <- t(fan_prices)
+
+future_dates <- seq(
+  from = max(ho$Date),
+  by = "month",
+  length.out = h + 1
+)[-1]
+
+plot(
+  future_dates, fan_prices[, "50%"],
+  type = "l", lwd = 2,
+  ylim = range(fan_prices),
+  xlab = "Date", ylab = "Price",
+  main = "Fan chart – Price forecast (APARCH)"
+)
+
+polygon(
+  c(future_dates, rev(future_dates)),
+  c(fan_prices[, "5%"], rev(fan_prices[, "95%"])),
+  col = rgb(0.85, 0.85, 0.85, 0.7),
+  border = NA
+)
+
+polygon(
+  c(future_dates, rev(future_dates)),
+  c(fan_prices[, "10%"], rev(fan_prices[, "90%"])),
+  col = rgb(0.7, 0.7, 0.7, 0.7),
+  border = NA
+)
+
+polygon(
+  c(future_dates, rev(future_dates)),
+  c(fan_prices[, "25%"], rev(fan_prices[, "75%"])),
+  col = rgb(0.5, 0.5, 0.5, 0.7),
+  border = NA
+)
+
+lines(future_dates, fan_prices[, "50%"], lwd = 2)
+points(tail(ho$Date,1), P0, pch = 16)
+
+
+
+```
+
+The widening of the bands as the forecast horizon extends reflects the increasing uncertainty inherent in financial time series forecasting. The asymmetry of the distribution — visible in the skewed shape of the fan — is consistent with the APARCH structure, which allows volatility to respond differently to the sign and magnitude of shocks. The central line (50% quantile) represents the median forecast, while the outer bands delineate plausible ranges of future price outcomes.
+Taken together, the simulation results confirm that the APARCH model not only fits the historical data well — as shown by the absence of residual ARCH effects and sign‑bias — but also generates coherent and interpretable forecasts.
+
+## Out-of-sample forecacst evaluation: rolling window and model comparisons against random walk
+
+
+
+```{r Rolling window on all models and random walk}
+# ---------------------------
+# 1) Dataset e rolling window
+# ---------------------------
+data <- r_ho_wins[1:240]      # 20 anni mensili
+window_length <- 120           # 10 anni rolling
+forecast_length <- length(data) - window_length
+
+# Liste per forecast e volatilità
+forecast_list <- list(
+  APARCH_10 = rep(NA, forecast_length),
+  APARCH_11 = rep(NA, forecast_length),
+  EGARCH_10 = rep(NA, forecast_length),
+  RW        = rep(NA, forecast_length)
+)
+
+sigma_list <- list(
+  APARCH_10 = rep(NA, forecast_length),
+  APARCH_11 = rep(NA, forecast_length),
+  EGARCH_10 = rep(NA, forecast_length)
+)
+
+# ---------------------------
+# 2) Specifiche modelli
+# ---------------------------
+spec_aparch_10 <- ugarchspec(
+  variance.model = list(model = "apARCH", garchOrder = c(1,1)),
+  mean.model     = list(armaOrder = c(1,0), include.mean = TRUE),
+  distribution.model = "norm",
+  fixed.pars = list(delta = 2)
+)
+
+spec_aparch_11 <- ugarchspec(
+  variance.model = list(model = "apARCH", garchOrder = c(1,1)),
+  mean.model     = list(armaOrder = c(1,1), include.mean = TRUE),
+  distribution.model = "norm",
+  fixed.pars = list(delta = 2)
+)
+
+spec_egarch_10 <- ugarchspec(
+  variance.model = list(model = "eGARCH", garchOrder = c(1,1)),
+  mean.model     = list(armaOrder = c(1,0), include.mean = TRUE),
+  distribution.model = "norm"
+)
+
+# ---------------------------
+# 3) Rolling Forecast
+# ---------------------------
+for(i in 1:forecast_length){
+  train <- data[i:(window_length + i - 1)]
+  
+  # APARCH 1,0
+  fit <- try(suppressWarnings(ugarchfit(spec_aparch_10, data=train, solver="hybrid")), silent=TRUE)
+  if(!inherits(fit,"try-error")){
+    fc <- ugarchforecast(fit, n.ahead=1)
+    forecast_list$APARCH_10[i] <- fitted(fc)
+    sigma_list$APARCH_10[i] <- sigma(fc)
+  }
+  
+  # APARCH 1,1
+  fit <- try(suppressWarnings(ugarchfit(spec_aparch_11, data=train, solver="hybrid")), silent=TRUE)
+  if(!inherits(fit,"try-error")){
+    fc <- ugarchforecast(fit, n.ahead=1)
+    forecast_list$APARCH_11[i] <- fitted(fc)
+    sigma_list$APARCH_11[i] <- sigma(fc)
+  }
+  
+  # EGARCH 1,0
+  fit <- try(suppressWarnings(ugarchfit(spec_egarch_10, data=train, solver="hybrid")), silent=TRUE)
+  if(!inherits(fit,"try-error")){
+    fc <- ugarchforecast(fit, n.ahead=1)
+    forecast_list$EGARCH_10[i] <- fitted(fc)
+    sigma_list$EGARCH_10[i] <- sigma(fc)
+  }
+  
+  # Random Walk
+  forecast_list$RW[i] <- tail(train,1)
+}
+
+# 4) Metriche di accuratezza (POINT FORECASTS ONLY)
+y_true <- data[(window_length+1):length(data)]  # out-of-sample
+
+model_names <- names(forecast_list)
+metrics <- data.frame(Model=model_names,
+                      RMSE=NA, MAE=NA)
+
+for(model in model_names){
+  y_pred <- forecast_list[[model]]
+  
+  metrics$RMSE[metrics$Model==model] <- rmse(y_true, y_pred)
+  metrics$MAE[metrics$Model==model]  <- mae(y_true, y_pred)
+}
+
+# 5) Diebold-Mariano tests (pairwise)
+dm_matrix <- matrix(NA, nrow=length(model_names), ncol=length(model_names),
+                    dimnames=list(model_names, model_names))
+
+for(i in 1:(length(model_names)-1)){
+  for(j in (i+1):length(model_names)){
+    e1 <- y_true - forecast_list[[model_names[i]]]
+    e2 <- y_true - forecast_list[[model_names[j]]]
+    dm <- dm.test(e1, e2, h=1, power=2)
+    dm_matrix[i,j] <- dm$p.value
+    dm_matrix[j,i] <- dm$p.value
+  }
+}
+
+# Results
+metrics
+dm_matrix
+
+
+```
+Point-forecast results show all GARCH-type models outperform the random walk in RMSE and MAE:
+  - APARCH(1,0): RMSE = 0.431, MAE = 0.354
+  - APARCH(1,1): RMSE = 0.439, MAE = 0.357
+  - EGARCH(1,0): RMSE = 0.432, MAE = 0.355
+  - Random Walk: RMSE = 0.606, MAE = 0.505
+This confirms that modeling both the conditional mean and volatility improves point forecasts.
+
+Among GARCH models, APARCH(1,0) and EGARCH(1,0) perform nearly identically. APARCH(1,1) with ARMA(1,1) shows slightly worse accuracy, likely due to over-parameterization. The MA(1) component in the mean was previously found statistically insignificant (ARIMA 1,1,1 vs 1,1,0), indicating it does not capture a stable feature of the data. Including it increases estimation uncertainty and adds noise in short-horizon forecasts without improving predictive power.
+
+Diebold–Mariano tests confirm all GARCH models significantly outperform the random walk (p-values ~10^-5), but differences among GARCH models themselves are not statistically significant. Overall, time-varying and asymmetric volatility is crucial, while simpler mean specifications like APARCH(1,0) or EGARCH(1,0) are sufficient and preferred for robustness.
+
+
+
+## Log-score and CRPS to select best model
+
+
+
+```{r}
+# ---------------------------
+# Log score & CRPS (FULL OOS, rolling-consistent)
+# ---------------------------
+
+models_to_eval <- c("APARCH_10", "APARCH_11", "EGARCH_10")
+T_oos <- length(y_true)
+
+results_dist <- data.frame(
+  Model = models_to_eval,
+  Mean_LogScore = NA,
+  Mean_CRPS = NA
+)
+
+for(i in seq_along(models_to_eval)){
+  
+  model <- models_to_eval[i]
+  
+  logscore_vec <- rep(NA, T_oos)
+  crps_vec     <- rep(NA, T_oos)
+  
+  for(t in 1:T_oos){
+    
+    mu_t <- forecast_list[[model]][t]
+    sigma_t <- sigma_list[[model]][t]
+    y_t <- y_true[t]
+    
+    # sicurezza
+    if(is.na(mu_t) || is.na(sigma_t)) next
+    
+    # Log score (negative log-likelihood, Normal)
+    logscore_vec[t] <- -dnorm(
+      y_t,
+      mean = mu_t,
+      sd = sigma_t,
+      log = TRUE
+    )
+    
+    # CRPS (Normal)
+    crps_vec[t] <- crps_norm(
+      y_t,
+      mean = mu_t,
+      sd = sigma_t
+    )
+  }
+  
+  results_dist$Mean_LogScore[i] <- mean(logscore_vec, na.rm = TRUE)
+  results_dist$Mean_CRPS[i]     <- mean(crps_vec, na.rm = TRUE)
+}
+
+results_dist
+
+
+
+```
+
+After evaluating point forecast accuracy and statistical significance with RMSE, MAE and the Diebold–Mariano test, we move to a probabilistic assessment using the log score and the CRPS.
+Log score
+ Measures how much probability the predictive density assigns to the realized outcome.
+ Lower values indicate that the model places higher likelihood on what actually occurs.
+CRPS (Continuous Ranked Probability Score)
+ Evaluates the entire predictive distribution by comparing its cumulative distribution to the realized value.
+ It jointly captures calibration and sharpness, with lower values indicating better probabilistic accuracy.
+Both metrics evaluate the entire predictive distribution, not only the conditional mean. The log score penalizes models that assign low probability to the realized outcome, while CRPS measures both calibration and sharpness of the predictive distribution.
+We compute these scores at each out-of-sample step using rolling-window forecasts and then average them over the full evaluation period.
+The results show very small differences across models. APARCH(1,0) achieves the lowest average log score and CRPS, followed closely by EGARCH(1,0), while the more complex APARCH(1,1) performs slightly worse.
+Overall, this confirms the earlier findings: increasing model complexity does not lead to meaningful gains in forecast performance. Simpler GARCH-type specifications appear sufficient for both point and density forecasting.”
+
+
+
+```{r Log score plot VECCHIO}
+
+t <- 50  # time step da visualizzare
+models_to_plot <- c("APARCH_10", "APARCH_11", "EGARCH_10")
+
+plot_list <- list()
+
+for(model in models_to_plot){
+  
+  mu_t <- forecast_list[[model]][t]
+  sigma_t <- if(model != "RW") sigma_list[[model]][t] else sd(y_true)
+  y_obs <- y_true[t]
+  
+  x_vals <- seq(mu_t - 4*sigma_t, mu_t + 4*sigma_t, length.out = 500)
+  dens_vals <- dnorm(x_vals, mean = mu_t, sd = sigma_t)
+  
+  df_plot <- data.frame(x = x_vals, density = dens_vals)
+  
+  p <- ggplot(df_plot, aes(x = x, y = density)) +
+    geom_line(color = "red", size = 1.2) +
+    geom_vline(xintercept = y_obs, color = "blue", linetype = "dashed", size = 1) +
+    labs(title = paste(model, "- t =", t),
+         x = "Value",
+         y = "Density") +
+    theme_minimal(base_size = 14)
+  
+  plot_list[[model]] <- p
+}
+
+# Mostra i tre plot affiancati
+grid.arrange(grobs = plot_list, nrow = 1, top = textGrob("Log-Score", gp=gpar(fontsize=18, fontface="bold")))
+
+
+```
+
+
+
+```{r CRPS VECCHIO}
+t <- 50  # tempo da visualizzare
+models_to_plot <- c("APARCH_10", "APARCH_11", "EGARCH_10")
+
+plot_list <- list()
+
+for(model in models_to_plot){
+  
+  mu_t <- forecast_list[[model]][t]
+  sigma_t <- if(model != "RW") sigma_list[[model]][t] else sd(y_true)
+  y_obs <- y_true[t]
+  
+  # CDF normale
+  x_vals <- seq(mu_t - 4*sigma_t, mu_t + 4*sigma_t, length.out = 500)
+  cdf_vals <- pnorm(x_vals, mean = mu_t, sd = sigma_t)
+  
+  df_plot <- data.frame(x = x_vals, cdf = cdf_vals)
+  
+  p <- ggplot(df_plot, aes(x = x, y = cdf)) +
+    geom_line(color = "red", size = 1.2) +
+    geom_vline(xintercept = y_obs, color = "blue", linetype = "dashed", size = 1) +
+    labs(title = paste(model, "- t =", t),
+         x = "Value",
+         y = "Cumulative Probability") +
+    theme_minimal(base_size = 14)
+  
+  plot_list[[model]] <- p
+}
+
+# Visualizza i tre plot affiancati con titolo principale "CRPS"
+grid.arrange(grobs = plot_list, nrow = 1, top = textGrob("CRPS", gp=gpar(fontsize=18, fontface="bold")))
+
+```
+
+#CONCLUSIONS AND LIMITATIONS 
+
+The out-of-sample evaluation confirms that GARCH-type models provide meaningful forecasting value for heating-oil returns: they consistently outperform the random walk benchmark in RMSE and MAE, and the Diebold–Mariano tests confirm this superiority is statistically significant. At the same time, the comparison across GARCH specifications shows that increased complexity does not translate into better forecasts. Both APARCH(1,0) and EGARCH(1,0) deliver the best performance with minimal differences, suggesting that parsimonious asymmetric volatility models are sufficient for this series. The probabilistic evaluation using log score and CRPS reinforces the same ranking, indicating that the models also produce well-calibrated predictive distributions. These findings support the practical credibility of the selected models: they can be used in real-time forecasting applications—such as risk assessment, volatility forecasting, and short-term decision-making—provided that the model is regularly re-estimated to adapt to changing market conditions. Overall, the results indicate that modeling conditional heteroskedasticity is essential for heating-oil price prediction, while excessive model complexity offers limited additional value.
+
+
+ 
+ 
