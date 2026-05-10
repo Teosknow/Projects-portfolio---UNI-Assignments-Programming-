@@ -1,0 +1,498 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# =============================================================================
+# visualizations.R
+# Requires: all_experiments_tidy.csv and all_experiments_summary.csv
+# =============================================================================
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(kableExtra)
+library(knitr)
+```
+
+
+# --- LOAD DATA ---------------------------------------------------------------
+
+
+```{r}
+# FIXED: Using read.csv because reshape script now saves with commas
+tidy    <- read.csv("all_experiments_tidy.csv",    stringsAsFactors = FALSE)
+summary <- read.csv("all_experiments_summary.csv", stringsAsFactors = FALSE)
+
+exp_order <- c(
+  "Exp1_Adaptive_Busiest_Short",
+  "Exp2_Stubborn_Busiest_Short",
+  "Exp3_Adaptive_Random_Short",
+  "Exp4_Stubborn_Random_Short",
+  "Exp5_Adaptive_Busiest_Long",
+  "Exp6_Stubborn_Busiest_Long",
+  "Exp7_Adaptive_Random_Long",
+  "Exp8_Stubborn_Random_Long"
+)
+
+# FIXED: Unified preparation into one object 'tidy_prepared'
+tidy_prepared <- tidy %>%
+  mutate(
+    experiment = factor(experiment, levels = exp_order),
+    plot_title = case_when(
+      grepl("Exp1", experiment) ~ "E1-Adaptive",
+      grepl("Exp2", experiment) ~ "E2-Stubborn",
+      grepl("Exp3", experiment) ~ "E3-Adaptive",
+      grepl("Exp4", experiment) ~ "E4-Stubborn",
+      grepl("Exp5", experiment) ~ "E5-Adaptive",
+      grepl("Exp6", experiment) ~ "E6-Stubborn",
+      grepl("Exp7", experiment) ~ "E7-Adaptive",
+      grepl("Exp8", experiment) ~ "E8-Stubborn"
+    ),
+    enforcement_duration = factor(enforcement_duration, 
+                                 levels = c("Short", "Long"),
+                                 labels = c("Enforcement duration: Short", 
+                                            "Enforcement duration: Long"))
+  )
+
+summary$experiment <- factor(summary$experiment, levels = exp_order)
+```
+
+
+# =============================================================================
+# PLOT 1 — Seizure Rate by Experiment
+# Dataset: tidy
+# =============================================================================
+
+```{r}
+
+p1 <- ggplot(tidy_prepared, aes(x = enforcement_target, y = seizure_rate_pct, fill = enforcement_target)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.3, size = 1) +
+  scale_fill_manual(values = c("Busiest" = "#9C27B0", "Random" = "#607D8B")) +
+  facet_grid(plot_title ~ enforcement_duration, scales = "free_y") + 
+  stat_summary(fun = mean, geom = "label", 
+               aes(label = sprintf("%.2f%%", ..y..)),
+               fill = "white", alpha = 0.8, size = 3, fontface = "bold") +
+  labs(title = "Seizure Rate Analysis", y = "Seizure Rate (%)", fill = "Strategy") +
+  theme_minimal()
+
+p1
+
+# After your ggplotly(p) or just p code:
+
+ggsave("Seizure Rate analysis.png", 
+     plot = p1,               # 'p' is your ggplot object
+      width = 12,             # Width in inches
+       height = 10,            # Height in inches
+       dpi = 300,              # High resolution for "beauty"
+      limitsize = FALSE)
+```
+
+
+# =============================================================================
+# PLOT 2 — FDI by Experiment
+# Dataset: tidy
+# =============================================================================
+
+```{r}
+# FIXED: Column name changed to drug_through_yellow_rate_pct
+p_fdi <- ggplot(tidy_prepared, aes(x = enforcement_target, y = drug_through_yellow_rate_pct, fill = enforcement_target)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.3, size = 1) +
+  stat_summary(fun = mean, geom = "label", 
+               aes(label = sprintf("%.2f%%", ..y..)),,
+               fill = "white", alpha = 0.8, size = 3, fontface = "bold") +
+  scale_fill_manual(values = c("Busiest" = "#9C27B0", "Random" = "#607D8B")) +
+  facet_grid(plot_title ~ enforcement_duration, scales = "free_y") + 
+  labs(title = "FDI Analysis (Drug Flow Displacement)", y = "FDI (% through shadow links)") +
+  theme_minimal()
+
+p_fdi
+
+#3. Save it to lock dimensions and prevent "crumpling"
+ggsave("FDI_Analysis_Grid.png", 
+       plot = p_fdi, 
+       width = 12, 
+       height = 10, 
+       dpi = 300)
+
+p_fdi
+```
+
+
+# =============================================================================
+# PLOT 3 — Deliveries vs Seizures side by side
+# Dataset: tidy
+# =============================================================================
+
+```{r}
+# FIXED: Reference tidy_prepared and corrected column names
+# --- 4. PLOT 3: Deliveries vs Seizures (With Value Labels) -------------------
+
+p_ds <- tidy_prepared %>%
+  select(experiment, total_delivered_value, total_seized_value) %>%
+  # Pivot to long format so we can plot both metrics side-by-side
+  pivot_longer(
+    cols      = starts_with("total_"), 
+    names_to  = "metric", 
+    values_to = "value"
+  ) %>%
+  mutate(metric = recode(metric, 
+    "total_delivered_value" = "Deliveries", 
+    "total_seized_value"    = "Seizures"
+  )) %>%
+  ggplot(aes(x = experiment, y = value, fill = metric)) +
+  # 1. The Bars
+  stat_summary(fun = "mean", geom = "bar", position = position_dodge(0.8), alpha = 0.8) +
+  
+  # 2. NEW: The Numerical Labels
+  # We use vjust = -0.5 to nudge the text slightly above the top of the bar
+  stat_summary(
+    fun = "mean", 
+    geom = "text", 
+    aes(label = sprintf("%.1f", ..y..)), 
+    position = position_dodge(width = 0.8), 
+    vjust = -0.5, 
+    size = 3.5, 
+    fontface = "bold"
+  ) +
+  
+  scale_fill_manual(values = c("Deliveries" = "#4CAF50", "Seizures" = "purple")) +
+  labs(
+    title = "Average Deliveries vs Seizures by Experiment", 
+    subtitle = "Labels indicate the mean volume for each metric",
+    x = NULL, 
+    y = "Average Volume",
+    fill = "Metric"
+  ) +
+  # Expand the y-axis slightly so the labels don't get cut off at the top
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+# Display the plot
+p_ds
+
+# Save the plot
+ggsave("Deliveries_vs_Seizures_Labeled.png", plot = p_ds, width = 12, height = 8, dpi = 300)
+```
+
+
+# =============================================================================
+# PLOT 4 — Heatmap: Mean FDI across the factorial grid
+# Dataset: summary
+# =============================================================================
+
+This plot represents a Heatmap Analysis of Flow Displacement, showing how successfully different cartel types bypass enforcement under various conditions.
+
+```{r}
+p_meanfdi <- summary |>
+  ggplot(aes(x = enforcement_target, y = cartel_type, fill = mean_drug_through_yellow_rate_pct)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  # Change the label logic here to add the % sign
+  geom_text(aes(label = paste0(round(mean_drug_through_yellow_rate_pct, 1), "%")),
+            size = 5, 
+            fontface = "bold") +
+  facet_wrap(~ enforcement_duration) +
+  scale_fill_gradient(low = "#E3F2FD", high = "#DC6826") +
+  labs(
+    title    = "Mean FDI — Factorial Grid",
+    subtitle = "Faceted by enforcement duration (Short vs Long)",
+    x        = "Enforcement Strategy",
+    y        = "Cartel Type",
+    fill     = "Mean FDI"
+  ) +
+  theme_minimal(base_size = 13)
+
+p_meanfdi
+
+ggsave("Mean FDI.png", 
+     plot = p_meanfdi, 
+      width = 12, 
+      height = 10, 
+       dpi = 300)
+
+
+```
+
+
+# =============================================================================
+# PLOT 5 — Interaction plot: FDI by cartel type x enforcement strategy
+# Dataset: summary
+# =============================================================================
+
+```{r}
+##SKIPPARE
+# FIXED: mean_fdi -> mean_drug_through_yellow_rate_pct
+summary %>%
+  filter(enforcement_duration == "Short") %>%
+  ggplot(aes(x = enforcement_target, y = mean_drug_through_yellow_rate_pct, 
+             color = cartel_type, group = cartel_type)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = mean_drug_through_yellow_rate_pct - sd_drug_through_yellow_rate_pct, 
+                    ymax = mean_drug_through_yellow_rate_pct + sd_drug_through_yellow_rate_pct), width = 0.1) +
+  scale_color_manual(values = c("Adaptive" = "#2196F3", "Stubborn" = "#FF5722")) +
+  labs(title = "Interaction Plot: FDI Strategy Response", y = "Mean FDI (%)") +
+  theme_minimal()
+```
+
+
+# =============================================================================
+# PLOT 6 — Shadow route accumulation (yellow links at end of run)
+# Dataset: tidy
+# =============================================================================
+
+```{r}
+# --- PLOT 6: Shadow Route Accumulation (Updated Layout) ----------------------
+
+p_shadow <- ggplot(tidy_prepared, aes(x = enforcement_target, y = count_links_with_color_yellow, fill = enforcement_target)) +
+  # Boxplot and Jitter
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.3, size = 1) +
+  
+  # Mean labels (formatted to 1 decimal place since this is a count)
+  stat_summary(fun = mean, geom = "label", 
+               aes(label = sprintf("%.1f", ..y..)),
+               fill = "white", alpha = 0.8, size = 3, fontface = "bold") +
+  
+  # Use the same color palette as Plot 1 & 2
+  scale_fill_manual(values = c("Busiest" = "#9C27B0", "Random" = "#607D8B")) +
+  
+  # Facet by Experiment (Rows) and Duration (Columns)
+  facet_grid(plot_title ~ enforcement_duration, scales = "free_y") + 
+  
+  labs(
+    title = "Shadow Route Accumulation Analysis", 
+    subtitle = "Count of yellow (clandestine) links at end of 1000 ticks",
+    x = "Targeting Strategy",
+    y = "Yellow Links (Count)",
+    fill = "Strategy"
+  ) +
+  theme_minimal()
+
+# Save with standard "beauty" dimensions
+ggsave("Shadow_Route_Analysis_Grid.png", 
+      plot = p_shadow, 
+      width = 12, 
+     height = 10, 
+       dpi = 300)
+
+p_shadow
+
+```
+  
+
+# =============================================================================
+# PLOT 7 — FDI vs Clustering Coefficient (Duijn et al. test)
+# Dataset: tidy
+# =============================================================================
+
+```{r}
+
+## SKIPPARE ##
+
+# FIXED: Column names synced with tidy dataset
+ggplot(tidy_prepared, aes(x = drug_through_yellow_rate_pct, y = clustering_rate_pct, 
+                          color = plot_title, shape = cartel_type)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(aes(group = 1), method = "lm", color = "black", linetype = "dashed") +
+  labs(title = "FDI vs Clustering Coefficient", x = "FDI (%)", y = "Clustering CoefFficient (%)") +
+  theme_minimal()
+```
+
+
+
+```{r}
+
+# 1. Prepare and format the data
+table_data_long <- summary %>%
+  # Ensure Adaptive comes before Stubborn for clean grouping
+  arrange(cartel_type, experiment) %>% 
+  rename(
+    "Type" = cartel_type,
+    "Experiment" = experiment,
+    "Target" = enforcement_target,
+    "Duration" = enforcement_duration,
+    "Runs" = n_runs,
+    "Avg Delivered" = mean_delivered,
+    "Avg Seized" = mean_seized,
+    "Seizure Rate" = mean_seizure_rate_pct,
+    "FDI (Flow %)" = mean_drug_through_yellow_rate_pct,
+    "Clustering" = mean_clustering_rate_pct
+  ) %>%
+  select(Type, Experiment, Target, Duration, Runs, 
+         `Avg Delivered`, `Avg Seized`, `Seizure Rate`, `FDI (Flow %)`, `Clustering`)
+
+# 2. Generate one single styled table
+kable(table_data_long, 
+      caption = "Summary Statistics: All Experiments",
+      booktabs = TRUE, 
+      digits = 2,
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = F, 
+                position = "left") %>%
+  # This merges the "Adaptive" and "Stubborn" cells so they don't repeat every row
+  collapse_rows(columns = 1, valign = "top") %>% 
+  row_spec(0, , color = "white", background = "#4A4A4A") %>%
+  column_spec(2,  ) # Bold the Experiment name
+```
+
+
+# =============================================================================
+# PLOT 8 — Highlighting inefficiency of random strategy
+# Dataset: summary
+# =============================================================================
+
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+
+# 1. Filter the summary data for the specific experiments
+# We use case_when to create clean labels for the X-axis
+plot_data <- summary %>%
+  filter(grepl("Exp1_|Exp3_|Exp7_", experiment)) %>%
+  mutate(
+    display_label = case_when(
+      grepl("Exp3", experiment) ~ "Exp 3\n(Random / Short)",
+      grepl("Exp7", experiment) ~ "Exp 7\n(Random / Long)",
+      grepl("Exp1", experiment) ~ "Exp 1\n(Targeted / Short)"
+    )
+  )
+
+# 2. Set the factor order so they appear side-by-side as requested
+plot_data$display_label <- factor(plot_data$display_label, 
+                                 levels = c("Exp 3\n(Random / Short)", 
+                                            "Exp 7\n(Random / Long)", 
+                                            "Exp 1\n(Targeted / Short)"))
+
+# 3. Create the high-contrast bar plot
+p_comparison <- ggplot(plot_data, aes(x = display_label, y = mean_drug_through_yellow_rate_pct, fill = display_label)) +
+  # Using mean_seizure_rate_pct based on your requirement
+  geom_col(aes(y = mean_seizure_rate_pct), color = "black", width = 0.6) +
+  # Add the percentage labels on top of the bars
+  geom_text(aes(y = mean_seizure_rate_pct, label = sprintf("%.1f%%", mean_seizure_rate_pct)), 
+            vjust = -0.8, size = 6, fontface = "bold") +
+  # High-contrast color palette: Greys for Random, Red for Targeted
+  scale_fill_manual(values = c(
+    "Exp 3\n(Random / Short)" = "#FFBF7F", # Light Grey
+    "Exp 7\n(Random / Long)"  = "#A5EDFF", # Dark Grey
+    "Exp 1\n(Targeted / Short)" = "#B2FF8C"  
+  )) +
+  # Formatting axes
+  scale_y_continuous(limits = c(0, 25), expand = c(0, 0)) +
+  labs(
+    title = "Targeting Efficiency vs. Brute Force",
+    subtitle = "Comparing Seizure Rates: Why Hub-Targeting beats Long-Duration Random policing",
+    x = "",
+    y = "Mean Seizure Rate (%)",
+    caption = "Exp 1 (5 days targeted) > Exp 7 (25 days random)"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold", size = 20),
+    axis.text.x = element_text(face = "bold", color = "black", size = 12),
+    axis.title.y = element_text(margin = margin(r = 10))
+    
+  )
+
+# Display and Save
+print(p_comparison)
+ggsave("Strategy_Efficiency_Comparison.png", p_comparison, width = 10, height = 7, dpi = 300)
+
+```
+
+# =============================================================================
+# PLOT 9 - Efficiency paradox
+# Dataset: summary
+# =============================================================================
+
+
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+
+plot_data <- data.frame(
+  Label = factor(
+    c("Exp3\nAdaptive·Random·Short", "Exp2\nStubborn·Busiest·Short",
+      "Exp1\nAdaptive·Busiest·Short", "Exp6\nStubborn·Busiest·Long",
+      "Exp5\nAdaptive·Busiest·Long"),
+    levels = c("Exp3\nAdaptive·Random·Short", "Exp2\nStubborn·Busiest·Short",
+               "Exp1\nAdaptive·Busiest·Short", "Exp6\nStubborn·Busiest·Long",
+               "Exp5\nAdaptive·Busiest·Long")
+  ),
+  Clustering = c(3.29, 5.53, 11.82, 10.50, 10.56),
+  Seizure    = c(2.35, 22.74, 19.94, 40.92, 41.64),
+  Phase = factor(
+    c("Baseline", "Short Raid", "Short Raid", "Long Surge", "Long Surge"),
+    levels = c("Baseline", "Short Raid", "Long Surge")
+  )
+)
+
+# Scale seizure onto the clustering y-axis
+scale_factor <- 52 / 16   # right axis max / left axis max
+
+p <- ggplot(plot_data, aes(x = Label)) +
+  # Bars — clustering coefficient
+  geom_col(aes(y = Clustering, fill = Phase),
+           color = "black", linewidth = 0.4, width = 0.55) +
+  # Clustering labels above bars
+  geom_text(aes(y = Clustering, label = paste0(round(Clustering, 1), "%")),
+            vjust = -0.5, size = 3.3, color = "grey40", fontface = "bold") +
+  # Line — seizure rate (scaled to left axis)
+  geom_line(aes(y = Seizure / scale_factor, group = 1),
+            color = "#1565C0", linewidth = 1.5) +
+  geom_point(aes(y = Seizure / scale_factor),
+             color = "#1565C0", size = 4, shape = 21,
+             fill = "#1565C0", stroke = 1.5) +
+  # Seizure labels near dots
+  geom_text(aes(y = Seizure / scale_factor,
+                label = paste0(round(Seizure, 1), "%")),
+            vjust = -1.1, size = 3.3, color = "#1565C0", fontface = "bold") +
+  # Dual y-axis
+  scale_y_continuous(
+    name     = "Clustering coefficient (%)",
+    limits   = c(0, 16),
+    expand   = expansion(mult = c(0, 0.12)),
+    sec.axis = sec_axis(~ . * scale_factor,
+                        name   = "Seizure rate (%)",
+                        breaks = seq(0, 50, 10),
+                        labels = function(x) paste0(x, "%"))
+  ) +
+  scale_fill_manual(values = c(
+    "Baseline"   = "#E3F2FD",
+    "Short Raid" = "#F5CA63",
+    "Long Surge" = "#DC6826"
+  )) +
+  labs(
+    title    = "The Efficiency-Hardening Paradox",
+    subtitle = "Bars: clustering coefficient  |  Line + dots: seizure rate",
+    x        = NULL,
+    fill     = "Phase"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.title.y.right = element_text(color = "#1565C0"),
+    axis.text.y.right  = element_text(color = "#1565C0"),
+    axis.text.x        = element_text(size = 9),
+    plot.title         = element_text(face = "bold"),
+    legend.position    = "bottom"
+  )
+
+print(p)
+ggsave("Enforcement_Tradeoff_DualAxis.png", p, width = 11, height = 6, dpi = 300)
+
+```
+
