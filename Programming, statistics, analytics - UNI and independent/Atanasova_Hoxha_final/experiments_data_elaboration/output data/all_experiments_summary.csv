@@ -1,0 +1,9 @@
+"experiment","cartel_type","enforcement_target","enforcement_duration","n_runs","mean_delivered","sd_delivered","mean_seized","sd_seized","mean_seizure_rate_pct","sd_seizure_rate_pct","mean_total_links","mean_yellow_links","mean_yellow_link_rate_pct","mean_drug_through_yellow_rate_pct","sd_drug_through_yellow_rate_pct","mean_clustering_rate_pct","sd_clustering_rate_pct","mean_first_yellow_tick","pct_never_adapted"
+"Exp1_Adaptive_Busiest_Short","Adaptive","Busiest","Short",30,4392.53,71.09,1093.7,49.9,19.94,0.92,218.4,162.37,74.32,42.03,4.17,11.82,1.36,5.2,0
+"Exp2_Stubborn_Busiest_Short","Stubborn","Busiest","Short",30,4226.47,81.06,1243.47,54.28,22.74,1.02,144.57,37.07,25.39,18.94,7.14,5.53,1.98,17.77,0
+"Exp3_Adaptive_Random_Short","Adaptive","Random","Short",30,5345.87,55.84,128.73,30.24,2.35,0.55,78.47,10.47,13.13,9.53,7.28,3.29,1.8,208.8,0
+"Exp4_Stubborn_Random_Short","Stubborn","Random","Short",30,5366.47,55.83,122.9,34.11,2.24,0.61,74.03,0,0,0,0,1.54,1.11,182,96.67
+"Exp5_Adaptive_Busiest_Long","Adaptive","Busiest","Long",30,3212.23,262.51,2293.53,281.14,41.64,4.94,214.97,163.5,75.99,45.15,5.25,10.56,1.48,5.03,0
+"Exp6_Stubborn_Busiest_Long","Stubborn","Busiest","Long",30,3240.5,325.81,2243.83,315.09,40.92,5.82,208.07,152.03,72.94,45.22,4.82,10.5,1.8,10.77,0
+"Exp7_Adaptive_Random_Long","Adaptive","Random","Long",30,4867.53,134.93,624.9,141.55,11.37,2.55,75.77,30.5,39.11,25.59,6.37,4.98,1.74,80.17,0
+"Exp8_Stubborn_Random_Long","Stubborn","Random","Long",30,4901.13,124.86,567.43,115.56,10.38,2.12,65.8,3.47,5.41,3.55,4.79,1.94,1.21,584.04,16.67

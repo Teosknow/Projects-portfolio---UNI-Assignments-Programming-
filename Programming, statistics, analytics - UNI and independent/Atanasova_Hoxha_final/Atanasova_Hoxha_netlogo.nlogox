@@ -1,0 +1,1781 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="true">
+  <code><![CDATA[extensions [ nw ] ; Load the Network Extension for advanced pathfinding and SNA metrics
+
+breed [ nodes node ]
+breed [ shipments shipment ]
+breed [ police-markers police-marker ]
+
+nodes-own [
+  role              ; Define if node is "supply", "transit", or "demand"
+  perceived-risk    ; Local memory of risk (0-100); used to calculate route-weight
+  police-presence   ; Countdown timer: how many days police remain at this hub
+]
+
+police-markers-own [
+  my-node ; Pointer variable to link the visual star to the specific occupied node
+]
+
+links-own [
+  base-cost         ; Static physical distance/transport cost (invariant)
+  route-weight      ; Dynamic cost: base-cost + node risk (used by the NW extension)
+  flow-count        ; Traffic volume tracker for the Flow Displacement Index (FDI)
+  days-since-used   ; Counter to track inactivity for infrastructure degradation
+]
+
+globals [
+  total-seized-value    ; Cumulative counter for all shipments lost to police
+  total-delivered-value ; Cumulative counter for all successful deliveries
+  recent-seized         ; Short-term seizure tally for the recent performance plot
+  recent-delivered      ; Short-term delivery tally for the recent performance plot
+  window-seized         ; Seizures within the current 90-day rolling window
+  window-delivered      ; Deliveries within the current 90-day rolling window
+  memory-window         ; Fixed at 90; the "memory" length for cartel adaptation
+  snapshot-seized       ; Stored window value for plotting/analysis
+  snapshot-delivered    ; Stored window value for plotting/analysis
+  first-yellow-tick     ; Timestamp of the very first adaptation (Balloon Effect)
+] 
+
+shipments-own [
+  target-node ; The destination "demand" node assigned at birth
+]
+
+to setup
+  apply-scenario  ; Loads experimental presets (Exp 1-8) before setup
+  clear-all
+  set memory-window 90   ; Define the cartel's observation period
+  set first-yellow-tick -1
+  set-default-shape nodes "circle"
+  set-default-shape shipments "box"
+  
+  ; 1. Generate the Scale-Free Network (Barabási-Albert model)
+  ; Creates a "Hub-and-Spoke" topology where a few nodes have many connections
+  nw:generate-preferential-attachment nodes links total-nodes 2
+  
+  ; 2. Assign Roles based on Degree Centrality
+  ; We sort nodes by connection count: low-degree become supply/demand, high-degree become transit hubs
+  let sorted-nodes sort-by [ [a b] -> count [link-neighbors] of a < count [link-neighbors] of b ] nodes
+  
+  ; Calculate role distribution based on UI slider percentages
+  let supply-count round (total-nodes * (percent-supply / 100))
+  let demand-count round (total-nodes * (percent-demand / 100))
+  
+  let n 0
+  foreach sorted-nodes [ current-node ->
+    ask current-node [
+      ifelse n < supply-count [
+        set role "supply" ; Green source nodes
+        set color green
+        set size 1.5
+      ] [
+        ifelse n < (supply-count + demand-count) [
+          set role "demand" ; Red market nodes
+          set color red
+          set size 1.5
+        ] [
+          set role "transit" ; Grey logistics hubs
+          set color gray
+          ; Scale visual size by connectivity to visually represent hubs
+          set size 1 + (count link-neighbors / 4)
+        ]
+      ]
+      set perceived-risk 0
+      set police-presence 0
+    ]
+    set n n + 1
+  ]
+  
+  ; 3. Initialize Link Attributes
+  ask links [
+    set base-cost 1 + random-float 5 ; Simulates geographic distance
+    set route-weight base-cost       ; At t=0, cost is purely distance-based
+    set flow-count 0                 
+    set days-since-used 0            ; All links start "fresh"
+  ]
+  
+  ; 4. Visual Layout
+  ; Spring layout pushes hubs to the center and leaves spokes on the periphery
+  repeat 150 [ layout-spring nodes links 0.2 12 4 ]
+  
+  reset-ticks
+end
+
+to go
+  ; 1. Spawning Shipments: Supply nodes generate product based on spawn-chance
+  ask nodes with [role = "supply"] [
+    if random 100 < spawn-chance [
+      hatch-shipments 1 [
+        set color yellow
+        set size 1.5
+        let my-destination one-of nodes with [role = "demand"]
+        set target-node my-destination
+      ]
+    ]
+  ]
+
+  ; 2. Moving Shipments: Agents navigate the network using Dijkstra's algorithm
+  ask shipments [
+    ifelse patch-here = [patch-here] of target-node [
+      ; SUCCESS: Shipment reached demand node
+      set total-delivered-value total-delivered-value + 1
+      set recent-delivered recent-delivered + 1
+      set window-delivered window-delivered + 1
+      die
+    ] [
+      let current-node one-of nodes-here
+      let my-target target-node
+      let next-step-node nobody
+
+      ask current-node [
+        ; Find the path with the LOWEST route-weight (balancing cost and risk)
+        let best-path nw:weighted-path-to my-target "route-weight"
+        if best-path != false and not empty? best-path [
+          let next-link first best-path
+          set next-step-node [other-end] of next-link
+          ask next-link [
+            set flow-count flow-count + 1 ; Record traffic for FDI metric
+            set days-since-used 0        ; Reset inactivity timer
+          ]
+        ]
+      ]
+
+      ifelse next-step-node != nobody [
+        move-to next-step-node
+      ] [
+        ; FAILURE: No path available (network is fragmented or too risky)
+        set total-seized-value total-seized-value + 1
+        set window-seized window-seized + 1
+        set recent-seized recent-seized + 1
+        die
+      ]
+    ]
+  ]                
+
+  ; 3. Enforcement Logic: Handle new raids and ongoing occupations
+  interdict
+    ask police-markers [
+    if [police-presence] of my-node = 0 [ die ]
+  ]
+  decay-risk            ; Gradually lower node risk levels as memories fade
+  update-route-weights  ; Re-calculate the "cost" of every link for the next tick
+
+  ; 4. Adaptation Logic: The cartel responds to pressure
+  adapt-network         ; Builds new "yellow" links if losses are too high
+  reset-window          ; Manages the 90-day rolling memory cycles
+  update-visuals        ; Adjusts hub sizes based on new connections
+  prune-dead-routes     ; Removes unused infrastructure (degradation)
+  do-plotting           ; Updates charts
+
+  wait 0.1 ; Delay to make the simulation visible to the user
+
+  tick
+end
+
+to prune-dead-routes
+  ; Simulates the removal of abandoned routes or infrastructure decay
+  ask links [
+    set days-since-used days-since-used + 1
+    
+    ; If a route hasn't been used in 180 days, it is removed from the network
+    if days-since-used > 180 [
+      die
+    ]
+  ]
+end
+
+to interdict
+  ; 1. TRIGGER NEW RAIDS: Decide if a new enforcement action occurs
+  if random 100 < enforcement-chance [
+    let raid-target nobody  
+    
+    ; Targeting Strategy: Either pick a random hub or the one with most current traffic
+    ifelse target-strategy = "Random Transit" [
+      set raid-target one-of nodes with [role = "transit"]
+    ] [
+      set raid-target max-one-of (nodes with [role = "transit"]) [count shipments-here]
+    ]
+    
+    ; If a target is found, set up the occupation
+    if raid-target != nobody [
+      ask raid-target [
+        set police-presence enforcement-duration ; Police stay for X ticks
+        set perceived-risk 100                  ; Risk spikes to maximum
+        set color orange                        ; Node turns orange (Active Raid)
+        ]
+        ; Place the blue star marker
+        if not any? police-markers with [my-node = raid-target] [
+          create-police-markers 1 [
+            set shape "star"
+            set color blue
+            set size 2
+            move-to raid-target
+            set my-node raid-target
+          ]
+      ]
+    ]
+  ]
+
+  ; 2. EXECUTE ONGOING OCCUPATIONS: Seize product passing through raid zones
+  ask nodes with [police-presence > 0] [
+    let seized count shipments-here
+    if seized > 0 [
+      set total-seized-value total-seized-value + seized
+      set recent-seized recent-seized + seized
+      set window-seized window-seized + seized  
+      ask shipments-here [ die ] ; Shipment is destroyed/seized
+    ]
+    
+    ; Decrement the occupation timer
+    set police-presence police-presence - 1
+   
+  ]
+end
+
+to update-route-weights
+  ; Recalculate edge weights: cost = physical distance + risk of start/end nodes
+  ; This forces the Dijkstra algorithm to find routes that avoid "hot" orange nodes
+  ask links [
+    let node1 end1
+    let node2 end2
+    set route-weight base-cost + ([perceived-risk] of node1) + ([perceived-risk] of node2)
+  ]
+end
+
+to decay-risk
+  ; Nodes eventually recover from raid stigma if no further action occurs
+  ask nodes with [perceived-risk > 0 and police-presence = 0] [
+    set perceived-risk perceived-risk - 5 ; Gradual decay
+    if perceived-risk <= 0 [
+      set perceived-risk 0
+      if role = "transit" [ set color gray ] ; Return to normal transit color
+    ]
+  ]
+end
+
+to adapt-network
+  ; The Balloon Effect Mechanism: Triggers new link creation if failure rates spike
+  let window-total (window-delivered + window-seized)
+
+  if window-total > 10 [
+    let failure-rate (window-seized / window-total) * 100
+
+    ; Compare recent performance against the cartel's internal loss-tolerance
+    if failure-rate > loss-tolerance-threshold [
+
+      ; OPTION 1: Rational Bypass (Connect neighbors of a currently raided node)
+      let hot-node one-of nodes with [role = "transit" and perceived-risk > 0]
+
+      ifelse hot-node != nobody [
+        ; Identify safe neighbors of the hot node
+        let safe-neighbors ([link-neighbors] of hot-node) with [
+          role = "transit" and perceived-risk < 20
+        ]
+        if count safe-neighbors >= 2 [
+          let candidate1 one-of safe-neighbors
+          let candidate2 one-of safe-neighbors with [self != candidate1]
+          if candidate1 != nobody and candidate2 != nobody [
+            ask candidate1 [
+              if not link-neighbor? candidate2 [
+                create-link-with candidate2 [
+                  set base-cost 1 + random-float 5
+                  set route-weight base-cost
+                  set color yellow ; Yellow signifies "new" infrastructure (adaptation)
+                  set thickness 0.3
+                  set flow-count 0
+                  set days-since-used 0
+                ]
+                if first-yellow-tick = -1 [set first-yellow-tick ticks]
+              ]
+            ]
+          ]
+        ]
+      ] [
+        ; OPTION 2: General Redundancy (Connect random safe hubs)
+        let candidate1 one-of nodes with [role = "transit" and perceived-risk < 20]
+        let candidate2 one-of nodes with [role = "transit" and perceived-risk < 20]
+        if candidate1 != nobody and candidate2 != nobody and candidate1 != candidate2 [
+          ask candidate1 [
+            if not link-neighbor? candidate2 [
+              create-link-with candidate2 [
+                set base-cost 1 + random-float 5
+                set route-weight base-cost
+                set color yellow
+                set thickness 0.3
+                set flow-count 0
+                set days-since-used 0
+              ]
+              if first-yellow-tick = -1 [set first-yellow-tick ticks]
+            ]
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+to reset-window
+  ; Logic for the 90-day memory window reset
+  if ticks mod memory-window = 0 [
+    set snapshot-seized window-seized
+    set snapshot-delivered window-delivered
+    set window-seized 0
+    set window-delivered 0
+  ]
+end
+
+to do-plotting
+  ; Update graph visualizations every 10 ticks for smoothness
+   if ticks mod 10 = 0 [
+    
+    ; Plotting Cumulative Success
+    set-current-plot "Cumulative Operational Success"
+    set-current-plot-pen "Delivered"
+    plotxy ticks total-delivered-value
+    set-current-plot-pen "Seized"
+    plotxy ticks total-seized-value
+    
+    ; Plotting the Systemic Risk level
+    set-current-plot "Systemic Risk"
+    set-current-plot-pen "Avg Hub Risk"
+    let avg-risk mean [perceived-risk] of nodes with [role = "transit"]
+    plotxy ticks avg-risk
+    
+    ; Plotting Network Expansion (Total links)
+    set-current-plot "Network Expansion"
+    set-current-plot-pen "Total Links"
+    plotxy ticks count links
+    
+    ; Flow Displacement Index (FDI): Traffic on new routes vs total traffic
+    set-current-plot "Flow Displacement"
+    let baseline-flow sum [flow-count] of links with [color != yellow]
+    let shifted-flow sum [flow-count] of links with [color = yellow]
+    let total-flow (baseline-flow + shifted-flow)
+    let current-fdi 0
+    if total-flow > 0 [
+      set current-fdi (shifted-flow / total-flow)
+    ]
+    set-current-plot-pen "FDI" 
+    plotxy ticks current-fdi
+    
+    ; Reset the flow counters after plotting
+    ask links [ set flow-count 0 ]
+
+    ; SNA Metrics: Clustering Coefficient (Network Hardening)
+    set-current-plot "Network Topology"   
+    set-current-plot-pen "Clustering"
+    plotxy ticks (mean [nw:clustering-coefficient] of nodes) * 100
+    
+    ; Recent Performance Plot (non-cumulative)
+    set-current-plot "Recent Performance: 10 ticks, reset at memory window"
+    set-current-plot-pen "Delivered (Recent)"
+    plotxy ticks recent-delivered
+    set-current-plot-pen "Seized (Recent)"
+    plotxy ticks recent-seized
+    
+    ; Reset recent performance counters at the end of the memory window
+    if ticks mod memory-window = 0 [  
+      set recent-delivered 0
+      set recent-seized 0
+    ]
+   
+  ]
+end
+    
+to update-visuals
+  ; Resize nodes dynamically based on their connection count (degree centrality)
+  ask nodes with [role = "transit"] [
+    let new-size 1 + (count link-neighbors / 4)
+    set size min (list new-size 4) ; Cap size for visual clarity
+  ]
+end
+
+to apply-scenario
+  ; EXPERIMENTAL SCENARIO FACTORY
+  ; Enforces preset parameters for the 8 specific experimental runs
+  if preset-scenario = "Custom" [ stop ]
+
+  set total-nodes 110
+  set spawn-chance 50
+  set enforcement-chance 40
+  set percent-supply 10
+  set percent-demand 10
+
+  ; Configure Experiment 1: High intelligence (Busiest), high reactivity (Adaptive), short duration
+  if preset-scenario = "Exp 1: Adaptive, Busiest, Short" [
+    set loss-tolerance-threshold 5    
+    set target-strategy "Busiest Transit"
+    set enforcement-duration 5        
+  ]
+
+  ; Configure Experiment 2: High intelligence, low reactivity (Stubborn), short duration
+  if preset-scenario = "Exp 2: Stubborn, Busiest, Short" [
+    set loss-tolerance-threshold 30   
+    set target-strategy "Busiest Transit"
+    set enforcement-duration 5        
+  ]
+
+  ; Configure Experiment 3: Random targeting, high reactivity (Adaptive), short duration
+  if preset-scenario = "Exp 3: Adaptive, Random, Short" [
+    set loss-tolerance-threshold 5    
+    set target-strategy "Random Transit"
+    set enforcement-duration 5        
+  ]
+
+  ; Configure Experiment 4: Random targeting, low reactivity (Stubborn), short duration
+  if preset-scenario = "Exp 4: Stubborn, Random, Short" [
+    set loss-tolerance-threshold 30   
+    set target-strategy "Random Transit"
+    set enforcement-duration 5        
+  ]
+
+  ; Configure Experiment 5: High intelligence, high reactivity (Adaptive), LONG duration
+  if preset-scenario = "Exp 5: Adaptive, Busiest, Long" [
+    set loss-tolerance-threshold 5    
+    set target-strategy "Busiest Transit"
+    set enforcement-duration 25       
+  ]
+
+  ; Configure Experiment 6: High intelligence, low reactivity (Stubborn), LONG duration
+  if preset-scenario = "Exp 6: Stubborn, Busiest, Long" [
+    set loss-tolerance-threshold 30   
+    set target-strategy "Busiest Transit"
+    set enforcement-duration 25       
+  ]
+  
+  ; Configure Experiment 7: Random targeting, high reactivity (Adaptive), LONG duration
+  if preset-scenario = "Exp 7: Adaptive, Random, Long" [
+    set loss-tolerance-threshold 5   
+    set target-strategy "Random Transit"
+    set enforcement-duration 25       
+  ]
+  
+  ; Configure Experiment 8: Random targeting, low reactivity (Stubborn), LONG duration
+  if preset-scenario = "Exp 8: Stubborn, Random, Long" [
+    set loss-tolerance-threshold 30   
+    set target-strategy "Random Transit"
+    set enforcement-duration 25       
+  ]
+end]]></code>
+  <widgets>
+    <view x="380" wrappingAllowedX="false" y="25" frameRate="30.0" minPycor="-35" height="929" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="false" width="929" tickCounterLabel="ticks" maxPycor="35" updateMode="0" maxPxcor="35" minPxcor="-35"></view>
+    <button x="120" y="20" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55" display="go">go</button>
+    <button x="190" y="20" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55" display="go">go</button>
+    <chooser x="20" y="75" height="100" variable="preset-scenario" current="6" width="252" display="preset-scenario">
+      <choice type="string" value="Custom"></choice>
+      <choice type="string" value="Exp 1: Adaptive, Busiest, Short"></choice>
+      <choice type="string" value="Exp 2: Stubborn, Busiest, Short"></choice>
+      <choice type="string" value="Exp 3: Adaptive, Random, Short"></choice>
+      <choice type="string" value="Exp 4: Stubborn, Random, Short"></choice>
+      <choice type="string" value="Exp 5: Adaptive, Busiest, Long"></choice>
+      <choice type="string" value="Exp 6: Stubborn, Busiest, Long"></choice>
+      <choice type="string" value="Exp 7: Adaptive, Random, Long"></choice>
+      <choice type="string" value="Exp 8: Stubborn, Random, Long"></choice>
+    </chooser>
+    <button x="25" y="20" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55" display="setup">setup</button>
+    <slider x="20" step="1" y="215" max="200" width="250" display="total-nodes" height="50" min="10" direction="Horizontal" default="110.0" variable="total-nodes"></slider>
+    <chooser x="20" y="630" height="60" variable="target-strategy" current="1" width="250" display="target-strategy">
+      <choice type="string" value="Random Transit"></choice>
+      <choice type="string" value="Busiest Transit"></choice>
+    </chooser>
+    <slider x="20" step="1" y="275" max="20" width="250" display="percent-supply" height="50" min="5" direction="Horizontal" default="10.0" variable="percent-supply"></slider>
+    <slider x="20" step="1" y="335" max="20" width="250" display="percent-demand" height="50" min="5" direction="Horizontal" default="10.0" variable="percent-demand"></slider>
+    <slider x="20" step="1" y="390" max="30" width="250" display="loss-tolerance-threshold" height="50" min="0" direction="Horizontal" default="30.0" variable="loss-tolerance-threshold"></slider>
+    <button x="275" y="105" height="59" disableUntilTicks="false" forever="false" kind="Observer" width="92" display="Apply">apply-scenario</button>
+    <plot x="1325" autoPlotX="true" yMax="10.0" autoPlotY="true" y="30" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" display="Cumulative Operational Success">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Delivered" color="-10899396" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Seized" color="-2674135" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="1325" autoPlotX="true" yMax="10.0" autoPlotY="true" y="210" xMin="0.0" height="176" legend="true" xMax="10.0" yMin="0.0" width="230" display="Recent Performance: 10 ticks, reset at memory window">
+      <setup></setup>
+      <update></update>
+      <pen interval="10.0" mode="1" display="Delivered (Recent)" color="-10899396" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="10.0" mode="1" display="Seized (Recent)" color="-2674135" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <slider x="20" step="1" y="450" max="50" width="250" display="enforcement-chance" height="50" min="0" direction="Horizontal" default="40.0" variable="enforcement-chance"></slider>
+    <slider x="20" step="1" y="570" max="50" width="250" display="spawn-chance" height="50" min="1" direction="Horizontal" default="50.0" variable="spawn-chance"></slider>
+    <slider x="20" step="1" y="510" max="60" width="250" display="enforcement-duration" height="50" min="1" direction="Horizontal" default="25.0" variable="enforcement-duration"></slider>
+    <monitor x="1430" precision="17" y="655" height="67" fontSize="11" width="112" display="Total Active Routes">count links</monitor>
+    <monitor x="1570" precision="17" y="35" height="60" fontSize="11" width="115" display="Total Delivered">total-delivered-value</monitor>
+    <monitor x="1695" precision="17" y="35" height="60" fontSize="11" width="110" display="Total Seized">total-seized-value</monitor>
+    <monitor x="1570" precision="17" y="105" height="60" fontSize="11" width="115" display="% Delivery Rate "><![CDATA[ifelse-value ((total-delivered-value + total-seized-value) > 0) [ precision ((total-delivered-value / (total-delivered-value + total-seized-value)) * 100) 1 ] [ 0 ]]]></monitor>
+    <monitor x="1695" precision="17" y="105" height="60" fontSize="11" width="110" display="% Seizure Rate "><![CDATA[ifelse-value ((total-delivered-value + total-seized-value) > 0) [ precision ((total-seized-value / (total-delivered-value + total-seized-value)) * 100) 1 ] [ 0 ]]]></monitor>
+    <monitor x="1570" precision="17" y="175" height="60" fontSize="11" width="115" display="10 ticks Delivery, reset at 90">recent-delivered</monitor>
+    <monitor x="1695" precision="17" y="175" height="60" fontSize="11" width="110" display="10 ticks Seizure Rate, reset at 90">recent-seized</monitor>
+    <monitor x="1570" precision="17" y="245" height="60" fontSize="11" width="115" display="% 10 ticks Delivery, reset at 90"><![CDATA[(ifelse-value (recent-delivered + recent-seized) > 0 
+  [ precision (recent-delivered / (recent-delivered + recent-seized) * 100) 1 ] 
+  [ 100 ])]]></monitor>
+    <monitor x="1695" precision="17" y="245" height="60" fontSize="11" width="110" display="% 10 ticks Seizure, reset at 90"><![CDATA[(ifelse-value (recent-delivered + recent-seized) > 0 
+  [ precision (recent-seized / (recent-delivered + recent-seized) * 100) 1 ] 
+  [ 0 ])]]></monitor>
+    <monitor x="1570" precision="17" y="315" height="60" fontSize="11" width="115" display="Snapshot 90 days delivered">snapshot-delivered</monitor>
+    <monitor x="1695" precision="17" y="315" height="60" fontSize="11" width="110" display="Snapshot 90 days seized">snapshot-seized</monitor>
+    <monitor x="1695" precision="17" y="380" height="60" fontSize="11" width="115" display="% snapshot delivered 90 days"><![CDATA[(ifelse-value (snapshot-delivered + snapshot-seized) > 0 
+  [ precision (snapshot-delivered / (snapshot-delivered + snapshot-seized) * 100) 1 ] 
+  [ 100 ])]]></monitor>
+    <monitor x="1570" precision="17" y="380" height="60" fontSize="11" width="115" display="% snapshot seized"><![CDATA[(ifelse-value (snapshot-delivered + snapshot-seized) > 0 
+  [ precision (snapshot-seized / (snapshot-delivered + snapshot-seized) * 100) 1 ] 
+  [ 0 ])]]></monitor>
+    <plot x="1575" autoPlotX="true" yMax="0.05" autoPlotY="true" y="450" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" display="Flow Displacement">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="FDI" color="-13345367" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="1575" autoPlotX="true" yMax="20.0" autoPlotY="true" y="630" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="20.0" width="230" display="Network Topology">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="2" display="Clustering" color="-8630108" legend="true">
+        <setup></setup>
+        <update>plot count turtles</update>
+      </pen>
+    </plot>
+    <plot x="1575" autoPlotX="true" yMax="10.0" autoPlotY="true" y="815" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" display="Network Expansion">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Total Links" color="-16777216" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="1325" autoPlotX="true" yMax="10.0" autoPlotY="true" y="390" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" display="Systemic Risk">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Avg Hub Risk" color="-955883" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+  </widgets>
+  <info><![CDATA[## WHAT IS IT?
+
+This model simulates the adaptive resilience of illicit trafficking networks under law enforcement pressure. It is a sociopolitical agent-based model grounded in criminology, specifically designed to demonstrate the Balloon Effect: the empirical phenomenon whereby targeted interdiction does not eliminate a criminal flow, but merely displaces it onto more clandestine, costly, and structurally complex pathways.
+
+The network is initialized using a Barabási-Albert preferential attachment algorithm, producing a scale-free topology in which a small number of highly connected transit hubs dominate the flow of shipments. This mirrors the real-world structure of organized crime logistics, where a few key warehouses, ports, or transfer cities handle the majority of product movement.
+
+The central thesis of the model is the concept of "Dark Resilience": the transition of a criminal network from a parasitic state (exploiting public, low-cost gray infrastructure) to an independent state (operating through private, high-cost, clandestine yellow corridors). Each yellow link that appears represents not a physical road, but a new act of corruption, a bribed official, a secret agreement with a local gang, or the activation of a covert logistics channel. Crucially, once activated, this shadow infrastructure persists as a permanent organizational asset — even when enforcement pressure fades and traffickers temporarily return to public routes.
+The model tests this thesis through a factorial experimental design that crosses two cartel types (adaptive vs. stubborn) with three enforcement regimes (blind, targeted, sustained), isolating which combination of criminal adaptability and state strategy is necessary and sufficient to produce the full Balloon Effect transition.
+
+
+## HOW IT WORKS
+
+The model contains three classes of agents and one class of links, each with distinct behavioral rules.
+Nodes are static locations. Green nodes (supply) probabilistically spawn shipment agents each tick. Red nodes (demand) act as sinks — a shipment reaching one is counted as a successful delivery and removed. Gray transit nodes form the backbone of the network; their visual size scales with their degree centrality, making hubs visually prominent. When raided, a transit node turns orange, its perceived-risk spikes to 100, and any shipment agent present is seized and destroyed.
+Shipment agents (yellow boxes) navigate using dynamic local rationality. At each transit node, the agent queries the node to calculate the least-cost path to the destination using the nw:weighted-path-to primitive
+
+They then follow the path of least resistance via nw:weighted-path-to. This means shipments avoid orange nodes not through intelligence, but because the inflated weight makes those routes prohibitively expensive compared to alternatives.
+
+Enforcement operates via the interdict procedure. Each tick, with probability enforcement-chance, police target either a random transit node (Random Transit mode) or the node currently hosting the highest number of shipments (Busiest Transit mode). The targeted node is occupied for enforcement-duration ticks, during which all passing shipments are seized. Risk then fades via the decay-risk procedure (fixed at −5 per tick) only after the police occupation ends, simulating both the redeployment of police resources and the gradual recovery of trafficker confidence. A full recovery from a raid therefore takes 20 ticks, representing a moderate institutional memory window.
+Network adaptation is governed by the adapt-network procedure. The failure-rate is computed over a rolling 90-tick memory window (window-seized / window-total). This means the cartel reacts to recent operational pressure rather than lifetime averages — a single raid-free period is enough to lower the perceived failure rate and pause adaptation, even if cumulative losses remain high. When this rate exceeds the loss-tolerance-threshold, the cartel activates a new yellow link between two low-risk transit nodes. Yellow links begin with zero perceived risk and represent the shadow economy corridor. They persist indefinitely (subject only to the prune-dead-routes rule, which removes links unused for 180 ticks), embodying the model's core argument: corrupted pathways are permanent organizational knowledge.
+
+
+## HOW TO USE IT
+
+Press Setup to initialize the network and Go to run the simulation continuously.
+
+### The parameters are:
+
+1. total-nodes
+Total number of nodes in the network at setup
+
+2. percent-supply
+Fraction of nodes designated as green supply nodes
+
+3. percent-demand
+Fraction of nodes designated as red demand nodes
+
+4. spawn-chance
+Probability (%) per tick that a supply node generates a new shipment
+
+5. enforcement-chance
+Probability (%) per tick that police conduct a raid
+
+6. enforcement-duration
+Number of ticks police occupy a raided node (the "trap" duration)
+
+7. loss-tolerance-threshold
+The failure rate (%) at which the cartel begins building yellow routes
+
+8. target-strategy
+Switches between Random Transit (blind policing) and Busiest Transit (intelligence-led policing)
+
+9. preset-scenario
+Loads one of six pre-configured experimental conditions (see below)
+
+Note: decay-risk is fixed at 5 points per tick across all experiments as a controlled assumption. This represents a moderate police memory window of 20 ticks and is not exposed as a slider to prevent unintended variation across runs.
+
+### Preset Scenarios — Factorial Design
+
+The eight scenarios implement a controlled factorial experiment crossing two cartel types with three enforcement regimes. All other parameters are held constant across all runs: total-nodes = 110, spawn-chance = 50, enforcement-chance = 40, percent-supply = 10, percent-demand = 10.
+The two cartel types differ only in loss-tolerance-threshold:
+Adaptive cartel (threshold = 5): a well-funded, paranoid organization that builds shadow routes at the first sign of trouble
+Stubborn cartel (threshold = 30): a rigid organization that absorbs losses and only innovates under existential pressure
+The four enforcement regimes differ in target-strategy and enforcement-duration:
+Blind enforcement: random targeting, short occupation
+Targeted enforcement: hub-focused targeting, short occupation
+Sustained enforcement: hub-focused targeting, long occupation
+This produces the following eight experiments:
+
+Experiment 1
+- Cartel Strategy: Adaptive (5)
+- Enforcement Pattern: Busiest Transit
+- Duration: Short (5)
+- Core Question: Balloon Effect baseline
+
+Experiment 2
+- Cartel Strategy: Stubborn (30)
+- Enforcement Pattern: Busiest Transit
+- Duration: Short (5)
+- Core Question: Does rigidity help or hurt under smart pressure?
+
+Experiment 3
+- Cartel Strategy: Adaptive (5)
+- Enforcement Pattern: Random Transit
+- Duration: Short (5)
+- Core Question: Does a reactive cartel need to adapt if enforcement is blind?
+
+Experiment 4
+- Cartel Strategy: Stubborn (30)
+- Enforcement Pattern: Random Transit
+- Duration: Short (5)
+- Core Question: Is random enforcement irrelevant regardless of cartel type?
+
+Experiment 5
+- Cartel Strategy: Adaptive (5)
+- Enforcement Pattern: Busiest Transit
+- Duration: Long (25)
+- Core Question: Does sustained occupation accelerate shadow‑route investment?
+
+Experiment 6
+- Cartel Strategy: Stubborn (30)
+- Enforcement Pattern: Busiest Transit
+- Duration: Long (25)
+- Core Question: Can sustained occupation force even a stubborn cartel to adapt?
+
+Experiment 7
+- Cartel Strategy: Adaptive (5)
+- Enforcement Pattern: Random 
+- Duration: Long (25)
+- Core question: Is long enforcement enough to overcome less intelligent enforcement?
+
+Experiment 8
+- Cartel Strategy: Stubborn (5)
+- Enforcement Pattern: Random 
+- Duration: Long (25)
+- Core question: Does culture type matter with random and long enforcement?
+
+These scenarios allow controlled comparisons to isolate effects. Such as:
+Exp 1 vs Exp 2 — cartel adaptability under identical intelligent enforcement
+Exp 1 vs Exp 3 — enforcement intelligence at identical cartel adaptability (the clean Balloon Effect test)
+Exp 1 vs Exp 5 — enforcement duration at identical cartel type and strategy
+
+### Plots
+
+Cumulative Operational Success: cumulative deliveries vs. seizures over time
+
+Recent Performance: operational deliveries and seizures per 10-tick window, reset every 50 ticks — shows the immediate reaction to raids rather than cumulative drift
+
+Flow Displacement Index (FDI): ratio of traffic on yellow shadow links vs. total traffic. FDI = 0 means all traffic uses gray routes; FDI = 1 means total displacement to clandestine corridors
+
+Systemic Risk: average perceived risk across all transit nodes
+
+Network Expansion: total link count over time, showing shadow-route accumulation
+
+Network Topology: mean clustering coefficient (×100), indicating the emergence of modular, cell-like network structures
+
+
+## THINGS TO NOTICE
+
+1. The FDI jump between Exp 1 and Exp 3 is your sharpest single observation. Both experiments use an identical adaptive cartel (threshold = 5%) under identical enforcement intensity (chance = 40%, duration = 5 ticks). The only difference is targeting strategy. Exp 3 (Random) produces a mean FDI of 9.5%; Exp 1 (Busiest) produces 42%. A single parameter change — where police look — causes a fourfold increase in shadow-route activation. This is the cleanest empirical demonstration that the Balloon Effect is not triggered by enforcement pressure alone, but specifically by enforcement intelligence.
+
+2. Watch Exp 4 closely: the FDI is exactly 0%. In all 30 runs, the stubborn cartel under random short enforcement never once built a yellow link. This is the strongest null result in the model. It means random enforcement fails so completely that it never generates enough failure-rate pressure to cross even the highest tolerance threshold. The cartel does not need to adapt because it is effectively never challenged. Compare this to Exp 2 — identical cartel, same duration, only the targeting changes — which produces 18.9% FDI. The difference between 0% and 18.9% is entirely attributable to enforcement intelligence.
+
+3.Observe the convergence between Exp 5 and Exp 6 under long targeted enforcement. Exp 5 (adaptive cartel) produces 45.15% FDI and 41.6% seizure rate. Exp 6 (stubborn cartel) produces 45.22% FDI and 40.9% seizure rate. These are nearly identical outcomes despite the two cartels having radically different tolerance thresholds (5% vs 30%). Sustained occupation pressure eventually forces even the most rigid cartel to activate shadow routes, erasing the organizational culture gap that was visible under short enforcement. What begins as meaningfully different organizations converges to the same structural outcome when pressure is sustained long enough.
+
+3. The seizure rate and FDI rise together in the long targeted experiments — this is the Duijn Paradox in your data. Exp 5 and Exp 6 produce the highest seizure rates in the entire factorial (~41%) and simultaneously the highest FDI (~45%) and clustering coefficients (~10.5%). The enforcement configuration most successful by the traditional seizure metric is the same one that produces the most hardened, most clandestine, most topologically dense criminal network. Compare the clustering coefficients: Exp 3 (random, short) shows 3.29%; Exp 1 (targeted, short) shows 11.82%; Exp 5 (targeted, long) shows 10.56%. The increase from baseline to targeted enforcement is the computational signature of network hardening — the same paradox Duijn et al. documented empirically with Dutch police data.
+
+4. Tracking the Network Expansion plot alongside the FDI plot reveals the dark residue. The FDI oscillates — it spikes when hubs are raided and dips when risk decays and traffic returns to gray routes. But the total link count in the Network Expansion plot does not oscillate: it rises monotonically and never falls back. Every enforcement cycle adds yellow links that persist permanently even when they go idle. By the end of a long Exp 1 run, the model typically shows around 260–300 total active routes compared to the initial topology. This growing shadow infrastructure is the organizational legacy of enforcement — it is never dismantled even if it is temporarily unused.
+
+5. Intelligence matters more than persistence. Exp 1 uses 5-tick targeted raids and achieves a 19.9% seizure rate. Exp 7 uses 25-tick random raids — five times the occupation duration — and achieves only 11.4%. Holding a random node for 25 days produces lower enforcement effectiveness than holding the right node for 5 days. Watch the Systemic Risk plot across these two experiments: in Exp 7, average hub risk remains low because the busiest nodes are never consistently targeted. In Exp 1, the same hubs are hit repeatedly and risk accumulates before decaying, creating a sustained deterrence signal across the core of the network.
+
+6. The network never collapses. Across all 8 experiments and all 30 runs each, total deliveries remain positive at tick 1000. Even under maximum sustained targeted pressure (Exp 5: ~3,212 deliveries vs ~2,294 seizures), roughly 58% of shipments still reach their destination. Watch the Cumulative Operational Success plot: the delivery line never reaches zero in any scenario. The cartel always finds a path. This is not a model failure — it is the central empirical finding, consistent with NarcoLogic (Magliocca et al. 2019) and the broader criminological literature on trafficking resilience.
+
+
+## THINGS TO TRY
+
+- Run Exp 1 and Exp 3 back to back — this is your cleanest single comparison. Everything is identical except target-strategy. The difference in FDI between these two runs is a direct measure of how much enforcement intelligence matters for triggering the Balloon Effect.
+
+- After running Exp 1 to 500 ticks, set enforcement-chance to 0. Watch the FDI drop as traffic returns to gray routes — but count how many yellow links remain in the Network Expansion plot. This is the "dark residue" of past enforcement: the shadow infrastructure that persists as permanent organizational capacity.
+
+- Compare Exp 2 and Exp 4. If both stubborn cartel scenarios produce similarly low FDI regardless of enforcement strategy, this suggests that cartel rigidity neutralizes the effect of enforcement intelligence entirely — an interesting null result worth documenting.
+
+- Run Exp 5 and watch the clustering coefficient. If it rises above its initial baseline during the long-occupation period, you are observing the Duijn et al. paradox in your own simulation: sustained targeted disruption produces a denser, more resilient network structure.
+
+- Test the limits of decapitation: modify Exp 5 by raising enforcement-chance to 80. Can maximum sustained targeted enforcement reduce deliveries to near zero, or does the adaptive cartel always find a way? This is the only true "victory" scenario for law enforcement in the model.
+
+## EXTENDING THE MODEL
+
+- Node-level corruption capacity: assign each transit node a bribery-cost variable. Yellow link creation would then consume a global cartel budget resource, adding an economic constraint to shadow-route activation and making the FDI a proxy for the cartel's financial drain.
+
+- Multiple competing cartels: introduce a second breed of shipment agents with a different color, each associated with a different organization. They would compete for the same gray infrastructure, potentially triggering each other's enforcement responses.
+
+- Police learning and memory: rather than purely random or purely greedy targeting, implement a police agent that maintains a suspicion-score for each node based on historical flow counts, producing more realistic adaptive law enforcement.
+
+- Node removal / decapitation events: allow the police to permanently destroy a transit node after multiple raids, rather than simply occupying it. This would test whether the yellow network can sustain the trade even after structural destruction of the original hub-and-spoke backbone.
+
+- Betweenness-centrality targeting: the current Busiest Transit mode approximates degree-based targeting. Implementing a third strategy that targets nodes with the highest betweenness centrality — the hidden brokers rather than the visible hubs — would allow direct testing of the finding from Hells Angels network research that the most structurally critical actor is often not the most visibly connected one.
+
+- Dual cartel profiles within a single run: implement two simultaneous cartel types operating on the same network, one adaptive and one stubborn. This would allow direct observation of competitive dynamics and test whether the stubborn organization free-rides on the yellow infrastructure built by the adaptive one.
+
+
+## NETLOGO FEATURES
+
+- nw:generate-preferential-attachment (from the nw extension): used during setup to generate the scale-free Barabási-Albert topology. This is the foundational structural choice of the model — it produces the hub-and-spoke vulnerability that makes Busiest Transit enforcement so powerful, and is empirically justified by Duxbury & Haynie (2018) who confirm power-law degree distributions in real drug distribution networks.
+
+- nw:weighted-path-to: the core of the bounded-rationality routing logic. Shipments use this to compute the minimum-weight path at each step, incorporating both physical cost and perceived risk. Because route-weight is updated every tick via update-route-weights, the pathfinding is fully dynamic and responsive to enforcement events.
+
+- nw:clustering-coefficient: used in do-plotting to compute the mean local clustering coefficient across all nodes. This is a non-trivial SNA metric that captures the emergence of modular cell structures as yellow links create new triangles in the topology.
+
+- plotxy ticks value: used throughout do-plotting instead of the simpler plot value. This explicitly anchors each data point to the real tick count on the x-axis, ensuring all plots share a consistent integer time scale regardless of how frequently each plot is updated.
+
+- hatch-shipments: used to spawn shipment agents directly from supply nodes, inheriting the node's coordinates. This avoids the need for a separate placement procedure.
+
+- ask current-node [ ... set next-step-node ... ]: a key workaround for scope management in NetLogo. Because nw:weighted-path-to must be called in the context of a node agent, shipments delegate the pathfinding query to the node they currently occupy, then retrieve the result through a shared local variable.
+
+## RELATED MODELS
+
+- Preferential Attachment (NetLogo Models Library → Networks): the foundational model for understanding scale-free network generation, upon which this model's topology is built.
+
+- Giant Component (NetLogo Models Library → Networks): demonstrates how targeted node removal can fragment a network — directly relevant to the decapitation enforcement strategy tested in Exp 5 and Exp 6.
+
+- Traffic Basic / Traffic Grid (NetLogo Models Library → Social Science): models of flow displacement under bottleneck conditions, analogous to the Balloon Effect dynamics explored here.
+
+- Virus on a Network (NetLogo Models Library → Networks): uses similar hub-and-spoke diffusion logic; the infection spreading through hubs mirrors how shipments exploit high-degree transit nodes.
+
+
+## CREDITS AND REFERENCES
+
+Model developed as a university project in Agent-Based Network Modelling.
+
+- Barabási, A.L. & Albert, R. (1999). Emergence of scaling in random networks. Science, 286(5439), 509–512. Foundational citation for the model's topology. Establishes the preferential attachment mechanism used in nw:generate-preferential-attachment to generate a scale-free network in which a small number of transit hubs accumulate disproportionate connectivity — the structural precondition for the hub-targeting enforcement strategy.
+
+- Bouchard, M. (2007). A capture-recapture model to estimate the size of criminal populations and the risks of detection in a marijuana cultivation industry. Journal of Research in Crime and Delinquency, 44(1), 31–57. Provides empirical grounding for the model's risk-perception and decay mechanics. Bouchard's work demonstrates that criminal networks actively manage exposure to detection risk and reorganize around it — directly motivating the perceived-risk variable and the trafficker boldness logic encoded in the decay-risk procedure.
+
+- Dorn, N., Levi, M., & King, L. (2005). Literature Review on Upper Level Drug Trafficking. Home Office Online Report. London: Home Office. Primary policy-level reference for the Balloon Effect and adaptive criminal logistics. Documents the empirical pattern whereby enforcement pressure on established routes displaces rather than eliminates traffic — the central phenomenon operationalized by the Flow Displacement Index (FDI) in this model.
+
+- Duxbury, S.W. & Haynie, D.L. (2018). The network structure of opioid distribution on a darknet cryptomarket. Journal of Quantitative Criminology, 34, 921–941. Provides empirical validation for the choice of preferential attachment as the network generation algorithm. Duxbury and Haynie confirm that degree distributions in real illicit drug markets follow a power law consistent with scale-free structure, demonstrating that this topology is not merely a modelling convenience but an empirically documented property of drug distribution networks.
+
+- Duijn, P.A.C., Kashirin, V., & Sloot, P.M.A. (2014). The relative ineffectiveness of criminal network disruption. Scientific Reports, 4, 4238. Key reference for the counterintuitive dynamics visible in the clustering coefficient plot under Exp 5 and Exp 6. Duijn et al. find that targeted disruption of criminal networks can paradoxically increase their cohesion and resilience — a result this model tests directly through the sustained occupation scenarios.
+
+- Magliocca, N.R. et al. (2019). Modeling cocaine traffickers and counterdrug interdiction forces as a complex adaptive system. Proceedings of the National Academy of Sciences, 116(16), 7784–7792. The primary benchmark for the modelling approach (NarcoLogic). Magliocca et al. demonstrate computationally that trafficking network proliferation and spatial resilience are a structural consequence of enforcement itself — the theoretical foundation of the Dark Resilience thesis and the factorial experimental design.
+
+- Morselli, C., Giguère, C., & Petit, K. (2007). The efficiency/security trade-off in criminal networks. Social Networks, 29(1), 143–153. Theoretical basis for the two cartel types in the experimental design. Morselli et al. establish that criminal networks face a structural trade-off between operational efficiency and internal security — operationalized here through the loss-tolerance-threshold parameter distinguishing adaptive from stubborn cartel profiles.
+
+- Simon, H.A. (1955). A behavioral model of rational choice. The Quarterly Journal of Economics, 69(1), 99–118. Theoretical foundation for the shipment agents' routing behavior. Rather than computing globally optimal paths, agents evaluate routes using locally available information (route-weight = base-cost + perceived-risk) and select the least-cost option visible at that moment — a direct implementation of Simon's satisficing logic.
+
+- Wilensky, U. (1999). NetLogo. Center for Connected Learning and Computer-Based Modeling, Northwestern University, Evanston, IL. https://ccl.northwestern.edu/netlogo/
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="Exp_1" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>ticks = 1000</exitCondition>
+      <metrics>
+        <metric>total-delivered-value</metric>
+        <metric>total-seized-value</metric>
+        <metric>count links</metric>
+        <metric>first-yellow-tick</metric>
+        <metric>count links with [color = yellow]</metric>
+        <metric>(sum [flow-count] of links with [color = yellow]) / (sum [flow-count] of links + 0.0001)</metric>
+        <metric>(mean [nw:clustering-coefficient] of nodes)</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="preset-scenario">
+          <value value="&quot;Exp 1: Adaptive, Busiest, Short&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="Exp_2" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>ticks = 1000</exitCondition>
+      <metrics>
+        <metric>total-delivered-value</metric>
+        <metric>total-seized-value</metric>
+        <metric>count links</metric>
+        <metric>first-yellow-tick</metric>
+        <metric>count links with [color = yellow]</metric>
+        <metric>(sum [flow-count] of links with [color = yellow]) / (sum [flow-count] of links + 0.0001)</metric>
+        <metric>(mean [nw:clustering-coefficient] of nodes)</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="preset-scenario">
+          <value value="&quot;Exp 2: Stubborn, Busiest, Short&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="Exp_3" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>ticks = 1000</exitCondition>
+      <metrics>
+        <metric>total-delivered-value</metric>
+        <metric>total-seized-value</metric>
+        <metric>count links</metric>
+        <metric>first-yellow-tick</metric>
+        <metric>count links with [color = yellow]</metric>
+        <metric>(sum [flow-count] of links with [color = yellow]) / (sum [flow-count] of links + 0.0001)</metric>
+        <metric>(mean [nw:clustering-coefficient] of nodes)</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="preset-scenario">
+          <value value="&quot;Exp 3: Adaptive, Random, Short&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="Exp_4" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>ticks = 1000</exitCondition>
+      <metrics>
+        <metric>total-delivered-value</metric>
+        <metric>total-seized-value</metric>
+        <metric>count links</metric>
+        <metric>first-yellow-tick</metric>
+        <metric>count links with [color = yellow]</metric>
+        <metric>(sum [flow-count] of links with [color = yellow]) / (sum [flow-count] of links + 0.0001)</metric>
+        <metric>(mean [nw:clustering-coefficient] of nodes)</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="preset-scenario">
+          <value value="&quot;Exp 4: Stubborn, Random, Short&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="Exp_5" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>ticks = 1000</exitCondition>
+      <metrics>
+        <metric>total-delivered-value</metric>
+        <metric>total-seized-value</metric>
+        <metric>count links</metric>
+        <metric>first-yellow-tick</metric>
+        <metric>count links with [color = yellow]</metric>
+        <metric>(sum [flow-count] of links with [color = yellow]) / (sum [flow-count] of links + 0.0001)</metric>
+        <metric>(mean [nw:clustering-coefficient] of nodes)</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="preset-scenario">
+          <value value="&quot;Exp 5: Adaptive, Busiest, Long&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="Exp_6" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>ticks = 1000</exitCondition>
+      <metrics>
+        <metric>total-delivered-value</metric>
+        <metric>total-seized-value</metric>
+        <metric>count links</metric>
+        <metric>first-yellow-tick</metric>
+        <metric>count links with [color = yellow]</metric>
+        <metric>(sum [flow-count] of links with [color = yellow]) / (sum [flow-count] of links + 0.0001)</metric>
+        <metric>(mean [nw:clustering-coefficient] of nodes)</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="preset-scenario">
+          <value value="&quot;Exp 6: Stubborn, Busiest, Long&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="Exp_7" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>ticks = 1000</exitCondition>
+      <metrics>
+        <metric>total-delivered-value</metric>
+        <metric>total-seized-value</metric>
+        <metric>count links</metric>
+        <metric>first-yellow-tick</metric>
+        <metric>count links with [color = yellow]</metric>
+        <metric>(sum [flow-count] of links with [color = yellow]) / (sum [flow-count] of links + 0.0001)</metric>
+        <metric>(mean [nw:clustering-coefficient] of nodes)</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="preset-scenario">
+          <value value="&quot;Exp 7: Adaptive, Random, Long&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="Exp_8" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>ticks = 1000</exitCondition>
+      <metrics>
+        <metric>total-delivered-value</metric>
+        <metric>total-seized-value</metric>
+        <metric>count links</metric>
+        <metric>first-yellow-tick</metric>
+        <metric>count links with [color = yellow]</metric>
+        <metric>(sum [flow-count] of links with [color = yellow]) / (sum [flow-count] of links + 0.0001)</metric>
+        <metric>(mean [nw:clustering-coefficient] of nodes)</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="preset-scenario">
+          <value value="&quot;Exp 8: Stubborn, Random, Long&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
